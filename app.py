@@ -116,31 +116,31 @@ class Trade(db.Model):
 COINDCX_PUBLIC = "https://public.coindcx.com"
 
 
-def fetch_candles(pair, interval="5m", limit=200):
+def fetch_candles(pair, interval="1h", limit=200):
     """
     pair must be CoinDCX format, e.g. 'B-BTC_USDT' (NOT 'BTCUSDT').
-    Returns a pandas DataFrame with open/high/low/close/volume, or None on failure.
+    interval must be one CoinDCX actually supports: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 1d
+    Returns (DataFrame or None, error_message or None) so callers can show the real reason.
     """
     try:
         r = requests.get(
-            f"{COINDCX_PUBLIC}/market_data/candles",
+            f"{COINDCX_PUBLIC}/market_data/candles/",  # trailing slash matters
             params={"pair": pair, "interval": interval, "limit": limit},
             timeout=10,
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:200]}"
         data = r.json()
         if not data:
-            return None
+            return None, "CoinDCX returned an empty candle list for this pair/interval"
         df = pd.DataFrame(data)
-        # CoinDCX returns keys: time, open, high, low, close, volume
         df = df.rename(columns=str.lower)
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col])
         df["time"] = pd.to_datetime(df["time"], unit="ms")
-        return df.sort_values("time").reset_index(drop=True)
+        return df.sort_values("time").reset_index(drop=True), None
     except Exception as e:
-        print(f"[fetch_candles] {pair} error: {e}")
-        return None
+        return None, f"{type(e).__name__}: {e}"
 
 
 # ─────────────────────────────────────────────
@@ -388,10 +388,12 @@ WATCHLIST = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-BNB_USDT"]
 def scan(current_user):
     results = []
     for pair in WATCHLIST:
-        df = fetch_candles(pair, interval="5m", limit=200)
+        df, err = fetch_candles(pair, interval="1h", limit=200)
         sig = compute_signal(df)
         sig["pair"] = pair
         sig["data_source"] = "real" if df is not None else "unavailable"
+        if err:
+            sig["reason"] = f"Data fetch failed: {err}"
         results.append(sig)
     return jsonify({"signals": results, "mode": current_user.mode}), 200
 
@@ -410,9 +412,9 @@ def execute(current_user):
     if side not in ("BUY", "SELL"):
         return jsonify({"error": "side must be BUY or SELL"}), 400
 
-    df = fetch_candles(pair, interval="5m", limit=5)
+    df, err = fetch_candles(pair, interval="1h", limit=5)
     if df is None:
-        return jsonify({"error": "Could not fetch live price — try again"}), 502
+        return jsonify({"error": f"Could not fetch live price: {err}"}), 502
     price = float(df["close"].iloc[-1])
 
     risk_amount = current_user.portfolio * 0.015  # 1.5% risk per trade
@@ -505,6 +507,22 @@ def log_trade(current_user):
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": datetime.datetime.utcnow().isoformat()})
+
+
+@app.route("/api/debug-candles", methods=["GET"])
+def debug_candles():
+    """Visit this in your browser to see the raw fetch attempt and error, if any."""
+    pair = request.args.get("pair", "B-BTC_USDT")
+    interval = request.args.get("interval", "1h")
+    df, err = fetch_candles(pair, interval=interval, limit=5)
+    if df is None:
+        return jsonify({"pair": pair, "interval": interval, "success": False, "error": err}), 200
+    return jsonify({
+        "pair": pair, "interval": interval, "success": True,
+        "rows_fetched": len(df),
+        "latest_close": float(df["close"].iloc[-1]),
+        "latest_time": str(df["time"].iloc[-1]),
+    }), 200
 
 
 # ─────────────────────────────────────────────
