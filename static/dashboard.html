@@ -235,7 +235,9 @@ canvas{width:100%!important;}
   async function realScan(){
     const container = document.getElementById('realScanResults');
     container.innerHTML = '<div style="color:var(--m1);font-size:11px;">Fetching real prices from CoinDCX...</div>';
-    const res = await algoApi('/scan');
+    const tf = document.getElementById('sigTF')?.value || MODES[S.mode].primaryTF || '5m';
+    const ctf = MODES[S.mode].confirmTF || '15m';
+    const res = await algoApi('/scan?interval=' + encodeURIComponent(tf) + '&confirm_interval=' + encodeURIComponent(ctf));
     if(!res){ return; }
     if(res.error){
       container.innerHTML = `<div style="color:var(--rd);font-size:11px;">${res.error}</div>`;
@@ -248,8 +250,8 @@ canvas{width:100%!important;}
         <span style="color:var(--cy);font-weight:700;min-width:90px;">${s.pair}</span>
         <span style="color:${badgeColor};font-weight:700;">${s.action}</span>
         <span style="color:var(--m1);">conf ${s.confidence}%</span>
-        ${s.price ? `<span style="color:var(--tx);">₹${s.price.toLocaleString('en-IN')}</span>` : ''}
-        <span style="color:${srcColor};font-size:9px;">[${s.data_source}]</span>
+        ${s.price ? `<span style="color:var(--tx);">${s.price.toLocaleString('en-US')} USDT</span>` : ''}
+        <span style="color:${srcColor};font-size:9px;">[${s.data_source}] ${s.actual_interval||''}${s.feed_age_seconds!=null?' · age '+s.feed_age_seconds+'s':''}</span>
         <span style="color:var(--m1);font-size:9px;flex:1;">${s.reason}</span>
         ${s.action !== 'WAIT' ? `<button class="btn btn-sm ${s.action==='BUY'?'btn-g':'btn-r'}" onclick="realExecute('${s.pair}','${s.action}',${s.confidence})">Execute</button>` : ''}
       </div>`;
@@ -448,7 +450,7 @@ canvas{width:100%!important;}
 <div class="panel" id="p-signals">
   <div class="fr mb12" style="align-items:flex-end;">
     <div class="fg" style="max-width:130px;"><label>Timeframe</label>
-      <select id="sigTF"><option>1m</option><option>3m</option><option selected>5m</option><option>15m</option><option>1h</option><option>4h</option></select></div>
+      <select id="sigTF" onchange="manualTFOverride()"><option>1m</option><option>5m</option><option selected>15m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option></select><div id="tfConfirm" style="font-size:9px;color:var(--m1);margin-top:4px">Confirm: 1h</div></div>
     <div class="fg" style="max-width:140px;"><label>Min Confidence</label>
       <select id="minConf"><option value="50">50%+</option><option value="65" selected>65%+</option><option value="75">75%+</option><option value="85">85%+</option></select></div>
     <div class="fg" style="max-width:160px;"><label>Sentiment Filter</label>
@@ -674,11 +676,11 @@ canvas{width:100%!important;}
 // CONFIG
 // ══════════════════════════════════════════
 const MODES={
-  scalp:{label:'⚡ Scalping',sl:.5,tp:1.0,maxPos:5,tf:'1m–5m',cap:10},
-  intraday:{label:'📊 Intraday',sl:.8,tp:1.8,maxPos:3,tf:'15m–1h',cap:7},
-  options:{label:'🎯 Options',sl:30,tp:80,maxPos:3,tf:'5m–15m',cap:1},
-  swing:{label:'🌊 Swing',sl:4,tp:12,maxPos:3,tf:'4h–1d',cap:3},
-  india:{label:'🇮🇳 India',sl:.8,tp:1.8,maxPos:3,tf:'5m–15m',cap:3},
+  scalp:{label:'⚡ Scalping',sl:.5,tp:1.0,maxPos:5,tf:'1m + 5m confirm',primaryTF:'1m',confirmTF:'5m',cap:10},
+  intraday:{label:'📊 Intraday',sl:.8,tp:1.8,maxPos:3,tf:'15m + 1h confirm',primaryTF:'15m',confirmTF:'1h',cap:7},
+  options:{label:'🎯 Options',sl:30,tp:80,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',cap:1},
+  swing:{label:'🌊 Swing',sl:4,tp:12,maxPos:3,tf:'4h + 1d confirm',primaryTF:'4h',confirmTF:'1d',cap:3},
+  india:{label:'🇮🇳 India',sl:.8,tp:1.8,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',cap:3},
 };
 const STRATS=[
   {id:0,name:'Smart Trend+Liq',wr:.66,lb:1},
@@ -970,7 +972,7 @@ function renderSigs(sigs){
         <div><div class="sig-pair">${s.pair}</div><div class="sig-sub">${s.ex} · ${s.vl.toUpperCase()} · ${M.label}</div></div>
         <span class="sbadge ${s.action}">${s.action}</span>
       </div>
-      <div class="smeta"><span>₹<b>${s.price.toLocaleString('en-IN',{maximumFractionDigits:2})}</b></span><span>SL:<b style="color:var(--rd)">₹${s.sl.toFixed(2)}</b></span><span>TP:<b style="color:var(--gn)">₹${s.tp.toFixed(2)}</b></span></div>
+      <div class="smeta"><span><b>${s.price.toLocaleString('en-US',{maximumFractionDigits:4})}</b> ${s.currency||'₹'}</span><span>SL:<b style="color:var(--rd)">${s.sl.toFixed(4)}</b></span><span>TP:<b style="color:var(--gn)">${s.tp.toFixed(4)}</b></span>${s.feedAge!=null?`<span>Age:${s.feedAge}s</span>`:''}</div>
       <div class="chips">${s.filters.map(f=>`<span class="chip ${f.c}">${f.l}</span>`).join('')}</div>
       <div class="cbar-row"><div class="cbar"><div class="cbar-fill" style="width:${s.conf}%;background:${cc}"></div></div><span class="cpct" style="color:${cc}">${s.conf}%</span></div>
       ${s.blocked&&s.action!=='WAIT'?`<div class="sent-block">🚫 ${s.sa.reason} — Trade blocked</div>`:''}
@@ -1162,17 +1164,35 @@ function closePos(pos,pWin){
 // ══════════════════════════════════════════
 // BOT
 // ══════════════════════════════════════════
-function scanNow(){
-  const pairs=S.mode==='india'?IPAIRS:CPAIRS;
-  const sigs=pairs.map(p=>computeSig(p,S.stratId));
+async function scanNow(){
+  if(S.mode==='india'){
+    const grid=document.getElementById('sigGrid');
+    if(grid) grid.innerHTML='<div class="alert a-r" style="grid-column:1/-1">India no-key certified live feed is not connected in this build. Synthetic India signals are disabled so they cannot contaminate paper results.</div>';
+    log('[INDIA] Synthetic signal generation BLOCKED — waiting for a reliable no-key public feed','warn');
+    return;
+  }
+  const tf=document.getElementById('sigTF')?.value||MODES[S.mode].primaryTF||'5m';
+  const ctf=MODES[S.mode].confirmTF||'15m';
+  const res=await algoApi('/scan?interval='+encodeURIComponent(tf)+'&confirm_interval='+encodeURIComponent(ctf));
+  if(!res||res.error){ log('Real scan failed: '+(res?.error||'no response'),'err'); return; }
+  const M=MODES[S.mode];
+  const sigs=(res.signals||[]).map(x=>{
+    const action=x.action||'WAIT', conf=x.confidence||0, price=Number(x.price||0);
+    const sl=action==='BUY'?price*(1-M.sl/100):price*(1+M.sl/100);
+    const tp=action==='BUY'?price*(1+M.tp/100):price*(1-M.tp/100);
+    const filters=[
+      {l:`RSI${x.rsi??'-'}`,c:'neut'},
+      {l:`TF ${x.actual_interval||tf}`,c:'liq'},
+      {l:`CONF ${x.confirm_actual_interval||ctf}`,c:x.confirmation_ok?'bull':'bear'},
+      {l:x.data_source&&x.data_source.startsWith('CoinDCX')?'LIVE✓':'DATA✗',c:x.data_source&&x.data_source.startsWith('CoinDCX')?'bull':'bear'}
+    ];
+    const li=aiLev(conf,S.stratId,'med',10);
+    const liqP=li.lev>1?(action==='BUY'?price*(1-1/li.lev*.9):price*(1+1/li.lev*.9)):0;
+    return {pair:x.display_pair||x.pair,apiPair:x.pair,ex:'CoinDCX',price,action,conf,filters,sl,tp,li,liqP,vl:'live',r:x.rsi,sa:{ok:x.confirmation_ok!==false,reason:`${x.reason} · ${x.actual_interval||tf} + ${x.confirm_actual_interval||ctf}`},blocked:x.data_source!=='CoinDCX public ticker + candles',currency:'USDT',feedAge:x.feed_age_seconds};
+  });
   renderSigs(sigs);
   const act=sigs.filter(s=>s.action!=='WAIT').length;
-  const blk=sigs.filter(s=>s.blocked&&s.action!=='WAIT').length;
-  log(`[${S.mode.toUpperCase()}] Scan: ${act} signals | ${blk} blocked | Sent:${S.sent.label}(${S.sent.score})`);
-  if(S.botOn){
-    const minC=parseInt(document.getElementById('minConf')?.value||'65');
-    sigs.forEach(s=>{if(s.action!=='WAIT'&&s.conf>=minC&&!s.blocked)paperTrade(s.pair,s.price,s.action,s.sl,s.tp,s.li.lev,s.ex,S.mode);});
-  }
+  log(`[${S.mode.toUpperCase()}] REAL CoinDCX scan: ${act} signals | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf}`,'ok');
 }
 function toggleBot(){
   S.botOn=!S.botOn;
@@ -1181,7 +1201,7 @@ function toggleBot(){
     btn.textContent='⏹ Stop Bot';btn.className='btn btn-r';
     badge.innerHTML='<span class="pulse">●</span> RUNNING';badge.className='hbadge live';
     const iv=parseInt(document.getElementById('scanEvery')?.value||'60')*1000;
-    S.botTimer=setInterval(()=>{scanNow();if(Math.random()>.7)refreshSentiment();},iv);
+    S.botTimer=setInterval(()=>{scanNow();},iv);
     scanNow();log(`🤖 Bot started | ${S.mode} | Lev:${S.levOn?S.levMode:'OFF'} | Sent:ON | Liq:ON`,'ok');
   }else{
     btn.textContent='▶ Start Bot';btn.className='btn btn-c';
@@ -1205,8 +1225,23 @@ function goTab(name){
   if(name==='swing')scanSwing();
   if(name==='analytics')renderAnalytics();
 }
+let tfManualOverride=false;
+function manualTFOverride(){
+  tfManualOverride=true;
+  const M=MODES[S.mode];
+  const tf=document.getElementById('sigTF')?.value||M.primaryTF;
+  const c=document.getElementById('tfConfirm'); if(c)c.textContent='Confirm: '+M.confirmTF+' · primary manually overridden to '+tf;
+}
+function applyModeTimeframes(force=true){
+  const M=MODES[S.mode];
+  const sel=document.getElementById('sigTF');
+  if(sel && (force || !tfManualOverride)) sel.value=M.primaryTF;
+  const c=document.getElementById('tfConfirm'); if(c)c.textContent='Confirm: '+M.confirmTF;
+}
 function switchMode(m){
   S.mode=m;const M=MODES[m];
+  tfManualOverride=false;
+  applyModeTimeframes(true);
   ['scalp','intraday','options','swing','india'].forEach(k=>{const b=document.getElementById('mb-'+k);if(b)b.className='mb';});
   const cls={scalp:'ms',intraday:'mi',options:'mo',swing:'mw',india:'mn'};
   const ab=document.getElementById('mb-'+m);if(ab)ab.className='mb '+cls[m];

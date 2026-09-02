@@ -143,6 +143,36 @@ def fetch_candles(pair, interval="1h", limit=200):
         return None, f"{type(e).__name__}: {e}"
 
 
+def fetch_live_ticker_price(pair):
+    """Fetch the current public CoinDCX last-traded price without authentication.
+    Candle close is kept for indicators; this ticker price is used for display/entry.
+    """
+    try:
+        market = pair.replace("B-", "").replace("_", "")
+        r = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
+        if r.status_code != 200:
+            return None, None, f"HTTP {r.status_code}"
+        rows = r.json()
+        row = next((x for x in rows if str(x.get("market", "")).upper() == market.upper()), None)
+        if not row:
+            return None, None, f"Ticker {market} not found"
+        price = float(row.get("last_price"))
+        # CoinDCX ticker timestamps may be seconds or ms depending on endpoint/version.
+        raw_ts = row.get("timestamp")
+        ts = None
+        if raw_ts is not None:
+            try:
+                v = float(raw_ts)
+                if v > 1e12:
+                    v /= 1000.0
+                ts = datetime.fromtimestamp(v, tz=timezone.utc)
+            except Exception:
+                ts = None
+        return price, ts, None
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
+
+
 # ─────────────────────────────────────────────
 # REAL INDICATORS — pure pandas, no external TA library needed
 # ─────────────────────────────────────────────
@@ -386,16 +416,70 @@ WATCHLIST = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-BNB_USDT"]
 @app.route("/api/scan", methods=["GET"])
 @token_required
 def scan(current_user):
+    requested_interval = (request.args.get("interval") or "15m").lower()
+    requested_confirm = (request.args.get("confirm_interval") or "1h").lower()
+    interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
+    interval = interval_map.get(requested_interval, "15m")
+    confirm_interval = interval_map.get(requested_confirm, "1h")
     results = []
     for pair in WATCHLIST:
-        df, err = fetch_candles(pair, interval="1h", limit=200)
-        sig = compute_signal(df)
+        df, err = fetch_candles(pair, interval=interval, limit=200)
+        cdf, cerr = fetch_candles(pair, interval=confirm_interval, limit=200)
+        primary = compute_signal(df)
+        confirm = compute_signal(cdf)
+        sig = dict(primary)
+
+        # Multi-timeframe confirmation: an actionable primary signal must agree
+        # with the higher confirmation timeframe. Conflicts become WAIT.
+        p_action = primary.get("action", "WAIT")
+        c_action = confirm.get("action", "WAIT")
+        confirmation_ok = p_action in ("BUY", "SELL") and p_action == c_action
+        if p_action in ("BUY", "SELL") and not confirmation_ok:
+            sig["action"] = "WAIT"
+            sig["confidence"] = min(int(primary.get("confidence", 0)), 49)
+            sig["reason"] = f"Primary {p_action} not confirmed by {confirm_interval} ({c_action}) | " + primary.get("reason", "")
+        elif confirmation_ok:
+            sig["confidence"] = min(95, round((int(primary.get("confidence",0))*0.65) + (int(confirm.get("confidence",0))*0.35)))
+            sig["reason"] = f"MTF confirmed {p_action} ({interval}+{confirm_interval}) | " + primary.get("reason", "")
+
+        live_price, ticker_ts, ticker_err = fetch_live_ticker_price(pair)
+        if live_price is not None:
+            sig["price"] = live_price
         sig["pair"] = pair
-        sig["data_source"] = "real" if df is not None else "unavailable"
-        if err:
-            sig["reason"] = f"Data fetch failed: {err}"
+        sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
+        sig["currency"] = "USDT"
+        sig["data_source"] = "CoinDCX public ticker + candles" if df is not None and cdf is not None and live_price is not None else "partial/unavailable"
+        sig["requested_interval"] = requested_interval
+        sig["actual_interval"] = interval
+        sig["confirm_requested_interval"] = requested_confirm
+        sig["confirm_actual_interval"] = confirm_interval
+        sig["confirmation_action"] = c_action
+        sig["confirmation_confidence"] = confirm.get("confidence", 0)
+        sig["confirmation_ok"] = confirmation_ok
+        if df is not None and len(df):
+            candle_ts = df["time"].iloc[-1]
+            sig["candle_time"] = candle_ts.isoformat() if hasattr(candle_ts, "isoformat") else str(candle_ts)
+        if cdf is not None and len(cdf):
+            ccandle_ts = cdf["time"].iloc[-1]
+            sig["confirm_candle_time"] = ccandle_ts.isoformat() if hasattr(ccandle_ts, "isoformat") else str(ccandle_ts)
+        if ticker_ts is not None:
+            sig["quote_time"] = ticker_ts.isoformat()
+            sig["feed_age_seconds"] = max(0, int((datetime.now(timezone.utc) - ticker_ts).total_seconds()))
+        else:
+            sig["quote_time"] = None
+            sig["feed_age_seconds"] = None
+        errors = [x for x in (err, cerr, ticker_err) if x]
+        if errors:
+            sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
         results.append(sig)
-    return jsonify({"signals": results, "mode": current_user.mode}), 200
+    return jsonify({
+        "signals": results,
+        "mode": current_user.mode,
+        "requested_interval": requested_interval,
+        "actual_interval": interval,
+        "confirm_requested_interval": requested_confirm,
+        "confirm_actual_interval": confirm_interval,
+    }), 200
 
 
 # ─────────────────────────────────────────────
@@ -412,10 +496,12 @@ def execute(current_user):
     if side not in ("BUY", "SELL"):
         return jsonify({"error": "side must be BUY or SELL"}), 400
 
-    df, err = fetch_candles(pair, interval="1h", limit=5)
+    df, err = fetch_candles(pair, interval="1m", limit=5)
     if df is None:
         return jsonify({"error": f"Could not fetch live price: {err}"}), 502
-    price = float(df["close"].iloc[-1])
+    price, _, ticker_err = fetch_live_ticker_price(pair)
+    if price is None:
+        price = float(df["close"].iloc[-1])
 
     risk_amount = current_user.portfolio * 0.015  # 1.5% risk per trade
     quantity = round(risk_amount / price, 6)
