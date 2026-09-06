@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import OperationalError
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 
@@ -37,6 +38,27 @@ if _db_url.startswith("postgres://"):
     _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = _db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# ── PERMANENT FIX for "SSL error: unexpected eof while reading" ──
+# Render's Postgres (and most managed Postgres) silently kills idle
+# connections after a few minutes. Without these settings, SQLAlchemy
+# keeps trying to reuse a connection that the server already closed,
+# causing intermittent OperationalError crashes on real requests.
+#
+# pool_pre_ping   -> tests each connection with a cheap query before use;
+#                    if it's dead, transparently opens a new one instead
+#                    of surfacing the error to your request.
+# pool_recycle    -> forces connections older than this many seconds to
+#                    be discarded and reopened, well before Render's own
+#                    idle timeout has a chance to kill them first.
+# Only applied for Postgres — SQLite (local dev) doesn't need or support this.
+if _db_url.startswith("postgresql://"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,
+        "pool_recycle": 280,   # seconds; stay under typical 5min idle cutoffs
+        "pool_size": 5,
+        "max_overflow": 2,
+    }
 
 db = SQLAlchemy(app)
 
@@ -375,7 +397,14 @@ def token_required(f):
             data = jwt.decode(
                 token, app.config["SECRET_KEY"], algorithms=["HS256"]
             )
-            current_user = User.query.get(data["user_id"])
+            # One retry on transient DB connection errors (belt-and-braces
+            # alongside pool_pre_ping above — covers the rare race where a
+            # connection dies between the ping and the actual query).
+            try:
+                current_user = User.query.get(data["user_id"])
+            except OperationalError:
+                db.session.rollback()
+                current_user = User.query.get(data["user_id"])
             if not current_user:
                 return jsonify({"error": "User not found"}), 401
         except jwt.ExpiredSignatureError:
