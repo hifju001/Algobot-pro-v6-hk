@@ -1,3 +1,18 @@
+# AlgoBot Pro v6 — V4 no-key live-paper feed fix
+
+This build fixes the V3 live crypto scanner.
+
+- Uses documented CoinDCX Spot candles endpoint: `https://api.coindcx.com/market_data/candles`.
+- Native Spot candle intervals used directly: 1m, 15m, 1h, 1d.
+- 5m, 30m and 4h are resampled from real lower-timeframe candles (no random/synthetic prices).
+- Mode mapping remains: Scalping 1m+5m, Intraday 15m+1h, Options 5m+15m, Swing 4h+1d.
+- Frontend now displays network/server/data errors in the Signals grid instead of failing silently.
+- Paper/live signal scan does not execute a trade unless real candle + ticker data is available.
+
+Note: the dedicated legacy Options/Backtest/Liquidity simulator sections still contain synthetic logic and must not be used to judge live-strategy performance. Use the Signals tab for V4 live-paper validation.
+
+---
+
 # AlgoBot Pro v6 — Backend + Website + PWA
 
 This folder is a complete deployable package:

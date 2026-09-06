@@ -223,12 +223,21 @@ canvas{width:100%!important;}
       'Content-Type': 'application/json',
       'Authorization': 'Bearer ' + ALGO_TOKEN
     }, options.headers || {});
-    const res = await fetch('/api' + path, options);
-    if(res.status === 401){
-      algoLogout();
-      return null;
+    try{
+      const res = await fetch('/api' + path, options);
+      if(res.status === 401){
+        algoLogout();
+        return null;
+      }
+      const text = await res.text();
+      let data;
+      try{ data = text ? JSON.parse(text) : {}; }
+      catch(_e){ return {error:`Server returned HTTP ${res.status} with non-JSON response: ${text.slice(0,180)}`}; }
+      if(!res.ok && !data.error) data.error = `HTTP ${res.status}`;
+      return data;
+    }catch(e){
+      return {error:'Network/server request failed: '+e.message};
     }
-    return res.json();
   }
 
   // ── REAL MARKET SCAN — calls the backend's real signal engine ──
@@ -245,7 +254,7 @@ canvas{width:100%!important;}
     }
     container.innerHTML = res.signals.map(s => {
       const badgeColor = s.action === 'BUY' ? 'var(--gn)' : s.action === 'SELL' ? 'var(--rd)' : 'var(--yl)';
-      const srcColor = s.data_source === 'real' ? 'var(--gn)' : 'var(--rd)';
+      const srcColor = s.data_source && s.data_source.startsWith('CoinDCX') ? 'var(--gn)' : 'var(--rd)';
       return `<div class="tr" style="margin-bottom:6px;">
         <span style="color:var(--cy);font-weight:700;min-width:90px;">${s.pair}</span>
         <span style="color:${badgeColor};font-weight:700;">${s.action}</span>
@@ -1174,7 +1183,13 @@ async function scanNow(){
   const tf=document.getElementById('sigTF')?.value||MODES[S.mode].primaryTF||'5m';
   const ctf=MODES[S.mode].confirmTF||'15m';
   const res=await algoApi('/scan?interval='+encodeURIComponent(tf)+'&confirm_interval='+encodeURIComponent(ctf));
-  if(!res||res.error){ log('Real scan failed: '+(res?.error||'no response'),'err'); return; }
+  if(!res||res.error){
+    const msg=(res?.error||'no response from server');
+    log('Real scan failed: '+msg,'err');
+    const grid=document.getElementById('sigGrid');
+    if(grid) grid.innerHTML=`<div class="alert a-r" style="grid-column:1/-1"><b>LIVE DATA ERROR</b><br>${msg}<br><span style="font-size:9px">The bot will not generate or paper-execute a signal until real candles are available.</span></div>`;
+    return;
+  }
   const M=MODES[S.mode];
   const sigs=(res.signals||[]).map(x=>{
     const action=x.action||'WAIT', conf=x.confidence||0, price=Number(x.price||0);
@@ -1250,7 +1265,7 @@ function switchMode(m){
   const rt=document.getElementById('rTP');if(rt)rt.value=M.tp;
   const rm=document.getElementById('rMax');if(rm)rm.value=M.maxPos;
   el('dMode',M.label);el('dModeSub',m==='india'?'NSE/BSE':'Crypto');
-  const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — ${M.tf} | SL:${M.sl}% | TP:${M.tp}%`;
+  const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | SL:${M.sl}% | TP:${M.tp}% | REAL CoinDCX candles`;
   calcRisk();scanNow();
 }
 
@@ -1520,8 +1535,8 @@ refreshSentiment();
 scanLiquidity();
 buildBrokerGrid();
 scanNow();
-log('🚀 AlgoBot Pro v6 ready','ok');
-log('🧠 Sentiment: Fear&Greed + News + Macro + India VIX active','sent');
+log('🚀 AlgoBot Pro v6 V4 feed-fix ready','ok');
+log('🧠 Signal validation uses real CoinDCX candles; synthetic modules are excluded from live-signal scan','sent');
 log('💧 Liquidity: Order Book + Volume Profile + Sweep Detection active','liq');
 log('🇮🇳 India Market: NIFTY + BANKNIFTY + Stocks | Brokers: Zerodha, Angel One, Stoxkart, Sahi, Fyers','ind');
 log('⚡ Leverage: Toggle ON/OFF anytime in top bar — AI auto or fixed multiplier');

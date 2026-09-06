@@ -113,62 +113,105 @@ class Trade(db.Model):
 # This is the SAME data source used whether you're in paper or live mode.
 # Only the execution step at the end differs between the two.
 # ─────────────────────────────────────────────
-COINDCX_PUBLIC = "https://public.coindcx.com"
+COINDCX_API = "https://api.coindcx.com"
+
+
+def _aggregate_candles(df, target_interval):
+    """Build unsupported higher timeframes only from genuine lower-timeframe CoinDCX candles."""
+    rules = {"5m": "5min", "30m": "30min", "4h": "4h"}
+    rule = rules.get(target_interval)
+    if not rule or df is None or df.empty:
+        return df
+    x = df.copy().set_index("time")
+    out = x.resample(rule, label="left", closed="left").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+    }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return out
 
 
 def fetch_candles(pair, interval="1h", limit=200):
     """
-    pair must be CoinDCX format, e.g. 'B-BTC_USDT' (NOT 'BTCUSDT').
-    interval must be one CoinDCX actually supports: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 1d
-    Returns (DataFrame or None, error_message or None) so callers can show the real reason.
+    Fetch real CoinDCX Spot candles without authentication.
+    Native Spot intervals documented by CoinDCX: 1m, 15m, 1h, 1d.
+    5m/30m/4h are constructed from real native candles (never synthetic/random).
+    Returns (DataFrame or None, error_message or None).
     """
     try:
+        # Source interval + enough source bars for useful indicator history.
+        source_map = {
+            "1m": ("1m", min(1000, max(limit, 200))),
+            "5m": ("1m", min(1000, max(limit * 5, 300))),
+            "15m": ("15m", min(1000, max(limit, 200))),
+            "30m": ("15m", min(1000, max(limit * 2, 300))),
+            "1h": ("1h", min(1000, max(limit, 200))),
+            "4h": ("1h", min(1000, max(limit * 4, 400))),
+            "1d": ("1d", min(1000, max(limit, 200))),
+        }
+        if interval not in source_map:
+            return None, f"Unsupported requested interval: {interval}"
+        source_interval, source_limit = source_map[interval]
         r = requests.get(
-            f"{COINDCX_PUBLIC}/market_data/candles/",  # trailing slash matters
-            params={"pair": pair, "interval": interval, "limit": limit},
-            timeout=10,
+            f"{COINDCX_API}/market_data/candles",
+            params={"pair": pair, "interval": source_interval, "limit": source_limit},
+            timeout=12,
+            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/4.0"},
         )
         if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: {r.text[:200]}"
+            return None, f"CoinDCX candles HTTP {r.status_code}: {r.text[:160]}"
         data = r.json()
-        if not data:
-            return None, "CoinDCX returned an empty candle list for this pair/interval"
-        df = pd.DataFrame(data)
-        df = df.rename(columns=str.lower)
+        if not isinstance(data, list) or not data:
+            return None, f"CoinDCX returned no candles for {pair} {source_interval}"
+        df = pd.DataFrame(data).rename(columns=str.lower)
+        needed = ["open", "high", "low", "close", "volume", "time"]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            return None, f"CoinDCX candle response missing: {','.join(missing)}"
         for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col])
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
-        return df.sort_values("time").reset_index(drop=True), None
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["time"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="ms", utc=True)
+        df = df.dropna(subset=needed).sort_values("time").reset_index(drop=True)
+        if interval in ("5m", "30m", "4h"):
+            df = _aggregate_candles(df, interval)
+        if len(df) > limit:
+            df = df.tail(limit).reset_index(drop=True)
+        if len(df) < 55:
+            return df, f"Only {len(df)} usable {interval} candles received"
+        return df, None
+    except requests.RequestException as e:
+        return None, f"CoinDCX network error: {e}"
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
 
 def fetch_live_ticker_price(pair):
-    """Fetch the current public CoinDCX last-traded price without authentication.
-    Candle close is kept for indicators; this ticker price is used for display/entry.
-    """
+    """Fetch current CoinDCX Spot last price without authentication."""
     try:
         market = pair.replace("B-", "").replace("_", "")
-        r = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
+        r = requests.get(
+            f"{COINDCX_API}/exchange/ticker", timeout=12,
+            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/4.0"}
+        )
         if r.status_code != 200:
-            return None, None, f"HTTP {r.status_code}"
+            return None, None, f"CoinDCX ticker HTTP {r.status_code}: {r.text[:120]}"
         rows = r.json()
+        if not isinstance(rows, list):
+            return None, None, "CoinDCX ticker returned non-list response"
         row = next((x for x in rows if str(x.get("market", "")).upper() == market.upper()), None)
         if not row:
             return None, None, f"Ticker {market} not found"
         price = float(row.get("last_price"))
-        # CoinDCX ticker timestamps may be seconds or ms depending on endpoint/version.
         raw_ts = row.get("timestamp")
         ts = None
         if raw_ts is not None:
             try:
                 v = float(raw_ts)
-                if v > 1e12:
-                    v /= 1000.0
+                if v > 1e12: v /= 1000.0
                 ts = datetime.fromtimestamp(v, tz=timezone.utc)
             except Exception:
                 ts = None
         return price, ts, None
+    except requests.RequestException as e:
+        return None, None, f"CoinDCX ticker network error: {e}"
     except Exception as e:
         return None, None, f"{type(e).__name__}: {e}"
 
