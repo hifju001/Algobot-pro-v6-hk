@@ -13,6 +13,8 @@ import time
 import datetime
 import requests
 import pandas as pd
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
@@ -183,37 +185,56 @@ def fetch_candles(pair, interval="1h", limit=200):
         return None, f"{type(e).__name__}: {e}"
 
 
-def fetch_live_ticker_price(pair):
-    """Fetch current CoinDCX Spot last price without authentication."""
+def fetch_all_tickers():
+    """Fetch CoinDCX public ticker once and return market->quote mapping."""
     try:
-        market = pair.replace("B-", "").replace("_", "")
         r = requests.get(
             f"{COINDCX_API}/exchange/ticker", timeout=12,
-            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/4.0"}
+            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/5.0"}
         )
         if r.status_code != 200:
-            return None, None, f"CoinDCX ticker HTTP {r.status_code}: {r.text[:120]}"
+            return {}, f"CoinDCX ticker HTTP {r.status_code}: {r.text[:120]}"
         rows = r.json()
         if not isinstance(rows, list):
-            return None, None, "CoinDCX ticker returned non-list response"
-        row = next((x for x in rows if str(x.get("market", "")).upper() == market.upper()), None)
-        if not row:
-            return None, None, f"Ticker {market} not found"
-        price = float(row.get("last_price"))
-        raw_ts = row.get("timestamp")
-        ts = None
-        if raw_ts is not None:
+            return {}, "CoinDCX ticker returned non-list response"
+        out = {}
+        for row in rows:
+            market = str(row.get("market", "")).upper()
+            if not market:
+                continue
             try:
-                v = float(raw_ts)
-                if v > 1e12: v /= 1000.0
-                ts = datetime.fromtimestamp(v, tz=timezone.utc)
+                price = float(row.get("last_price"))
             except Exception:
-                ts = None
-        return price, ts, None
+                continue
+            ts = None
+            raw_ts = row.get("timestamp")
+            if raw_ts is not None:
+                try:
+                    v = float(raw_ts)
+                    if v > 1e12:
+                        v /= 1000.0
+                    ts = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+                except Exception:
+                    ts = None
+            out[market] = (price, ts)
+        return out, None
     except requests.RequestException as e:
-        return None, None, f"CoinDCX ticker network error: {e}"
+        return {}, f"CoinDCX ticker network error: {e}"
     except Exception as e:
-        return None, None, f"{type(e).__name__}: {e}"
+        return {}, f"{type(e).__name__}: {e}"
+
+
+def fetch_live_ticker_price(pair, ticker_map=None):
+    """Return current public CoinDCX Spot price; reuses ticker_map when supplied."""
+    market = pair.replace("B-", "").replace("_", "").upper()
+    if ticker_map is None:
+        ticker_map, err = fetch_all_tickers()
+        if err:
+            return None, None, err
+    row = ticker_map.get(market)
+    if not row:
+        return None, None, f"Ticker {market} not found"
+    return row[0], row[1], None
 
 
 # ─────────────────────────────────────────────
@@ -459,70 +480,118 @@ WATCHLIST = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-BNB_USDT"]
 @app.route("/api/scan", methods=["GET"])
 @token_required
 def scan(current_user):
-    requested_interval = (request.args.get("interval") or "15m").lower()
-    requested_confirm = (request.args.get("confirm_interval") or "1h").lower()
-    interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
-    interval = interval_map.get(requested_interval, "15m")
-    confirm_interval = interval_map.get(requested_confirm, "1h")
-    results = []
+    """Real CoinDCX scan. Network calls are parallelized to avoid Render gateway timeouts."""
+    try:
+        requested_interval = (request.args.get("interval") or "15m").lower()
+        requested_confirm = (request.args.get("confirm_interval") or "1h").lower()
+        interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
+        interval = interval_map.get(requested_interval, "15m")
+        confirm_interval = interval_map.get(requested_confirm, "1h")
+
+        # Fetch the full ticker only ONCE per scan instead of once per symbol.
+        ticker_map, ticker_global_err = fetch_all_tickers()
+
+        # Fetch primary + confirmation candles concurrently. V4 did 8 candle
+        # requests sequentially, which could exceed Render's request window.
+        candle_results = {}
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for pair in WATCHLIST:
+                jobs[pool.submit(fetch_candles, pair, interval, 200)] = (pair, "primary")
+                jobs[pool.submit(fetch_candles, pair, confirm_interval, 200)] = (pair, "confirm")
+            for fut in as_completed(jobs):
+                pair, kind = jobs[fut]
+                try:
+                    candle_results[(pair, kind)] = fut.result()
+                except Exception as e:
+                    candle_results[(pair, kind)] = (None, f"{type(e).__name__}: {e}")
+
+        results = []
+        for pair in WATCHLIST:
+            df, err = candle_results.get((pair, "primary"), (None, "Primary candle request missing"))
+            cdf, cerr = candle_results.get((pair, "confirm"), (None, "Confirmation candle request missing"))
+            primary = compute_signal(df)
+            confirm = compute_signal(cdf)
+            sig = dict(primary)
+
+            p_action = primary.get("action", "WAIT")
+            c_action = confirm.get("action", "WAIT")
+            confirmation_ok = p_action in ("BUY", "SELL") and p_action == c_action
+            if p_action in ("BUY", "SELL") and not confirmation_ok:
+                sig["action"] = "WAIT"
+                sig["confidence"] = min(int(primary.get("confidence", 0)), 49)
+                sig["reason"] = f"Primary {p_action} not confirmed by {confirm_interval} ({c_action}) | " + primary.get("reason", "")
+            elif confirmation_ok:
+                sig["confidence"] = min(95, round((int(primary.get("confidence",0))*0.65) + (int(confirm.get("confidence",0))*0.35)))
+                sig["reason"] = f"MTF confirmed {p_action} ({interval}+{confirm_interval}) | " + primary.get("reason", "")
+
+            live_price, ticker_ts, ticker_err = fetch_live_ticker_price(pair, ticker_map)
+            if ticker_global_err and not ticker_err:
+                ticker_err = ticker_global_err
+            if live_price is not None:
+                sig["price"] = live_price
+            sig["pair"] = pair
+            sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
+            sig["currency"] = "USDT"
+            sig["data_source"] = "CoinDCX public ticker + candles" if df is not None and cdf is not None and live_price is not None else "partial/unavailable"
+            sig["requested_interval"] = requested_interval
+            sig["actual_interval"] = interval
+            sig["confirm_requested_interval"] = requested_confirm
+            sig["confirm_actual_interval"] = confirm_interval
+            sig["confirmation_action"] = c_action
+            sig["confirmation_confidence"] = confirm.get("confidence", 0)
+            sig["confirmation_ok"] = confirmation_ok
+            if df is not None and len(df):
+                candle_ts = df["time"].iloc[-1]
+                sig["candle_time"] = candle_ts.isoformat() if hasattr(candle_ts, "isoformat") else str(candle_ts)
+            if cdf is not None and len(cdf):
+                ccandle_ts = cdf["time"].iloc[-1]
+                sig["confirm_candle_time"] = ccandle_ts.isoformat() if hasattr(ccandle_ts, "isoformat") else str(ccandle_ts)
+            if ticker_ts is not None:
+                sig["quote_time"] = ticker_ts.isoformat()
+                sig["feed_age_seconds"] = max(0, int((datetime.datetime.now(datetime.timezone.utc) - ticker_ts).total_seconds()))
+            else:
+                sig["quote_time"] = None
+                sig["feed_age_seconds"] = None
+            errors = [x for x in (err, cerr, ticker_err) if x]
+            if errors:
+                sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
+            results.append(sig)
+
+        return jsonify({
+            "signals": results,
+            "mode": current_user.mode,
+            "requested_interval": requested_interval,
+            "actual_interval": interval,
+            "confirm_requested_interval": requested_confirm,
+            "confirm_actual_interval": confirm_interval,
+            "feed_status": "ok" if any(x.get("data_source", "").startswith("CoinDCX") for x in results) else "unavailable",
+        }), 200
+    except Exception as e:
+        app.logger.exception("/api/scan crashed")
+        return jsonify({
+            "error": f"SCAN_ENGINE_ERROR: {type(e).__name__}: {e}",
+            "hint": "Check Render logs for the full traceback."
+        }), 500
+
+
+@app.route("/api/feed-test", methods=["GET"])
+@token_required
+def feed_test(current_user):
+    """Fast diagnostics for CoinDCX public ticker/candle connectivity."""
+    out = {"ticker": {}, "candles": {}}
+    ticker_map, terr = fetch_all_tickers()
+    out["ticker"]["ok"] = not bool(terr)
+    out["ticker"]["error"] = terr
     for pair in WATCHLIST:
-        df, err = fetch_candles(pair, interval=interval, limit=200)
-        cdf, cerr = fetch_candles(pair, interval=confirm_interval, limit=200)
-        primary = compute_signal(df)
-        confirm = compute_signal(cdf)
-        sig = dict(primary)
-
-        # Multi-timeframe confirmation: an actionable primary signal must agree
-        # with the higher confirmation timeframe. Conflicts become WAIT.
-        p_action = primary.get("action", "WAIT")
-        c_action = confirm.get("action", "WAIT")
-        confirmation_ok = p_action in ("BUY", "SELL") and p_action == c_action
-        if p_action in ("BUY", "SELL") and not confirmation_ok:
-            sig["action"] = "WAIT"
-            sig["confidence"] = min(int(primary.get("confidence", 0)), 49)
-            sig["reason"] = f"Primary {p_action} not confirmed by {confirm_interval} ({c_action}) | " + primary.get("reason", "")
-        elif confirmation_ok:
-            sig["confidence"] = min(95, round((int(primary.get("confidence",0))*0.65) + (int(confirm.get("confidence",0))*0.35)))
-            sig["reason"] = f"MTF confirmed {p_action} ({interval}+{confirm_interval}) | " + primary.get("reason", "")
-
-        live_price, ticker_ts, ticker_err = fetch_live_ticker_price(pair)
-        if live_price is not None:
-            sig["price"] = live_price
-        sig["pair"] = pair
-        sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
-        sig["currency"] = "USDT"
-        sig["data_source"] = "CoinDCX public ticker + candles" if df is not None and cdf is not None and live_price is not None else "partial/unavailable"
-        sig["requested_interval"] = requested_interval
-        sig["actual_interval"] = interval
-        sig["confirm_requested_interval"] = requested_confirm
-        sig["confirm_actual_interval"] = confirm_interval
-        sig["confirmation_action"] = c_action
-        sig["confirmation_confidence"] = confirm.get("confidence", 0)
-        sig["confirmation_ok"] = confirmation_ok
-        if df is not None and len(df):
-            candle_ts = df["time"].iloc[-1]
-            sig["candle_time"] = candle_ts.isoformat() if hasattr(candle_ts, "isoformat") else str(candle_ts)
-        if cdf is not None and len(cdf):
-            ccandle_ts = cdf["time"].iloc[-1]
-            sig["confirm_candle_time"] = ccandle_ts.isoformat() if hasattr(ccandle_ts, "isoformat") else str(ccandle_ts)
-        if ticker_ts is not None:
-            sig["quote_time"] = ticker_ts.isoformat()
-            sig["feed_age_seconds"] = max(0, int((datetime.now(timezone.utc) - ticker_ts).total_seconds()))
-        else:
-            sig["quote_time"] = None
-            sig["feed_age_seconds"] = None
-        errors = [x for x in (err, cerr, ticker_err) if x]
-        if errors:
-            sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
-        results.append(sig)
-    return jsonify({
-        "signals": results,
-        "mode": current_user.mode,
-        "requested_interval": requested_interval,
-        "actual_interval": interval,
-        "confirm_requested_interval": requested_confirm,
-        "confirm_actual_interval": confirm_interval,
-    }), 200
+        market = pair.replace("B-", "").replace("_", "").upper()
+        item = ticker_map.get(market)
+        out["ticker"][pair] = item[0] if item else None
+    # One pair is enough to verify each native timeframe quickly.
+    for tf in ("1m", "15m", "1h", "1d"):
+        df, err = fetch_candles("B-BTC_USDT", tf, 60)
+        out["candles"][tf] = {"ok": df is not None and len(df) > 0, "rows": 0 if df is None else len(df), "error": err}
+    return jsonify(out), 200
 
 
 # ─────────────────────────────────────────────
@@ -673,6 +742,15 @@ def serve_static(path):
 with app.app_context():
     db.create_all()
 
+
+
+@app.errorhandler(Exception)
+def json_unhandled_error(e):
+    # Keep API failures machine-readable instead of Flask's HTML 500 page.
+    if request.path.startswith("/api/"):
+        app.logger.error("Unhandled API exception: %s\n%s", e, traceback.format_exc())
+        return jsonify({"error": f"UNHANDLED_SERVER_ERROR: {type(e).__name__}: {e}"}), 500
+    raise e
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
