@@ -522,9 +522,12 @@ def scan(current_user):
 
         # Fetch primary + confirmation candles concurrently. V4 did 8 candle
         # requests sequentially, which could exceed Render's request window.
+        # max_workers kept modest (not len(jobs)) because Render's free tier
+        # gives ~512MB RAM per instance; too many concurrent pandas DataFrames
+        # in memory at once was crashing the worker with SIGSEGV (exit 139).
         candle_results = {}
         jobs = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             for pair in WATCHLIST:
                 jobs[pool.submit(fetch_candles, pair, interval, 200)] = (pair, "primary")
                 jobs[pool.submit(fetch_candles, pair, confirm_interval, 200)] = (pair, "confirm")
