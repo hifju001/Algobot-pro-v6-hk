@@ -1,4 +1,4 @@
-const CACHE_NAME = "algobot-v6-cache-1";
+const CACHE_NAME = "algobot-v7-cache-20260906";
 const ASSETS = ["/login.html", "/dashboard.html", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
@@ -19,7 +19,8 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// Network-first for API calls (always want fresh data), cache-first for static files
+// API is always network-only. HTML/JS shell is network-first so new deploys
+// cannot be trapped behind an old cached dashboard. Cache is offline fallback only.
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.pathname.startsWith("/api/")) {
@@ -27,6 +28,14 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((response) => {
+        if (event.request.method === "GET" && response && response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        }
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

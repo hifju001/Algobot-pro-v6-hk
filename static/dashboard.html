@@ -700,8 +700,8 @@ const STRATS=[
   {id:5,name:'Liquidity Sweep',wr:.67,lb:1},
 ];
 const CPAIRS=[
-  {sym:'BTC/USDT',ex:(x.data_source||'Public Feed').replace(' public data',''),base:62000,ml:10},
-  {sym:'ETH/USDT',ex:(x.data_source||'Public Feed').replace(' public data',''),base:3200,ml:10},
+  {sym:'BTC/USDT',ex:'Public Feed',base:62000,ml:10},
+  {sym:'ETH/USDT',ex:'Public Feed',base:3200,ml:10},
   {sym:'SOL/USDT',ex:'Delta',base:148,ml:5},
   {sym:'BNB/USDT',ex:'Delta',base:580,ml:8},
   {sym:'MATIC/USDT',ex:'Delta',base:.92,ml:5},
@@ -1527,19 +1527,29 @@ async function setLiveMode(){
 function doReset(){if(!confirm('Reset all data?'))return;S.trades=[];S.positions=[];S.optTrades=[];S.portfolio=S.capital;S.dailyLoss=0;S.equityCurve=[S.capital];updDash();log('🔄 Reset','warn');}
 
 // ══════════════════════════════════════════
-// INIT
+// INIT — fault-isolated so one optional module cannot freeze the entire UI
 // ══════════════════════════════════════════
-switchMode('scalp');
-calcRisk();
-refreshSentiment();
-scanLiquidity();
-buildBrokerGrid();
-scanNow();
-log('🚀 AlgoBot Pro v6 V4 feed-fix ready','ok');
-log('🧠 Signal validation uses real CoinDCX candles; synthetic modules are excluded from live-signal scan','sent');
-log('💧 Liquidity: Order Book + Volume Profile + Sweep Detection active','liq');
-log('🇮🇳 India Market: NIFTY + BANKNIFTY + Stocks | Brokers: Zerodha, Angel One, Stoxkart, Sahi, Fyers','ind');
-log('⚡ Leverage: Toggle ON/OFF anytime in top bar — AI auto or fixed multiplier');
+function safeInit(name, fn){
+  try{ fn(); }
+  catch(e){
+    console.error('[AlgoBot init] '+name, e);
+    try{ log('⚠️ '+name+' init failed: '+e.message,'err'); }catch(_e){}
+  }
+}
+window.addEventListener('error', (e)=>{
+  console.error('[AlgoBot runtime]', e.error||e.message);
+  try{ log('⚠️ UI error: '+(e.message||'unknown error'),'err'); }catch(_e){}
+});
+safeInit('mode', ()=>switchMode('scalp'));
+safeInit('risk', calcRisk);
+safeInit('sentiment', refreshSentiment);
+safeInit('liquidity', scanLiquidity);
+safeInit('brokers', buildBrokerGrid);
+safeInit('signals', ()=>scanNow());
+log('🚀 AlgoBot Pro v6 V7 stable core loaded','ok');
+log('📡 Signals use real public CoinDCX/Binance market candles; no API key required','sent');
+log('🧯 UI modules are fault-isolated so one module cannot freeze mode switching or Signals','ok');
+log('🇮🇳 India synthetic live signals remain disabled until a reliable real feed is connected','ind');
 </script>
 </body>
 </html>

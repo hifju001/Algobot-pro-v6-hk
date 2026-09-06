@@ -1,3 +1,15 @@
+# AlgoBot Pro v6 — V7 Stable Core / Live Paper Fix
+
+This build fixes the frontend freeze and backend list/DataFrame mismatch found in the deployed V6 repository.
+
+- Fixes fatal `x is not defined` error in `CPAIRS` initialization that prevented mode switching, sentiment, liquidity and signal initialization.
+- Fixes `/api/scan`, `/api/execute` and `/api/debug-candles` to use the list-of-dicts candle format returned by the V6 lightweight feed layer.
+- Preserves CoinDCX primary + Binance public fallback without API keys.
+- Reports the actual public source used for a signal.
+- Adds fault-isolated UI startup so one optional module cannot freeze the entire dashboard.
+- Changes the service worker to a new cache version and network-first app shell, preventing old dashboard code from surviving a new Render deployment.
+- India synthetic signals remain disabled for live-paper validation.
+
 # AlgoBot Pro v6 — V6 Render-safe dual public feed
 
 This build addresses repeated Render HTTP 502 errors during live crypto scans.

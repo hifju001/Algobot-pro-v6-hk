@@ -634,7 +634,16 @@ def scan(current_user):
             sig["pair"] = pair
             sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
             sig["currency"] = "USDT"
-            sig["data_source"] = "CoinDCX public ticker + candles" if df is not None and cdf is not None and live_price is not None else "partial/unavailable"
+            candle_sources = {
+                row.get("_source") for rows in (df, cdf) if rows for row in rows[-1:] if row.get("_source")
+            }
+            ticker_source = ticker_map.get("__SOURCE__") if isinstance(ticker_map, dict) else None
+            if ticker_source:
+                candle_sources.add(ticker_source)
+            if df and cdf and live_price is not None and candle_sources:
+                sig["data_source"] = "/".join(sorted(candle_sources)) + " public data"
+            else:
+                sig["data_source"] = "partial/unavailable"
             sig["requested_interval"] = requested_interval
             sig["actual_interval"] = interval
             sig["confirm_requested_interval"] = requested_confirm
@@ -642,12 +651,12 @@ def scan(current_user):
             sig["confirmation_action"] = c_action
             sig["confirmation_confidence"] = confirm.get("confidence", 0)
             sig["confirmation_ok"] = confirmation_ok
-            if df is not None and len(df):
-                candle_ts = df["time"].iloc[-1]
-                sig["candle_time"] = candle_ts.isoformat() if hasattr(candle_ts, "isoformat") else str(candle_ts)
-            if cdf is not None and len(cdf):
-                ccandle_ts = cdf["time"].iloc[-1]
-                sig["confirm_candle_time"] = ccandle_ts.isoformat() if hasattr(ccandle_ts, "isoformat") else str(ccandle_ts)
+            if df:
+                candle_ms = int(df[-1].get("time", 0) or 0)
+                sig["candle_time"] = datetime.datetime.fromtimestamp(candle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if candle_ms else None
+            if cdf:
+                ccandle_ms = int(cdf[-1].get("time", 0) or 0)
+                sig["confirm_candle_time"] = datetime.datetime.fromtimestamp(ccandle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if ccandle_ms else None
             if ticker_ts is not None:
                 sig["quote_time"] = ticker_ts.isoformat()
                 sig["feed_age_seconds"] = max(0, int((datetime.datetime.now(datetime.timezone.utc) - ticker_ts).total_seconds()))
@@ -666,7 +675,7 @@ def scan(current_user):
             "actual_interval": interval,
             "confirm_requested_interval": requested_confirm,
             "confirm_actual_interval": confirm_interval,
-            "feed_status": "ok" if any(x.get("data_source", "").startswith("CoinDCX") for x in results) else "unavailable",
+            "feed_status": "ok" if any("public data" in x.get("data_source", "") for x in results) else "unavailable",
         }), 200
     except Exception as e:
         app.logger.exception("/api/scan crashed")
@@ -714,7 +723,7 @@ def execute(current_user):
         return jsonify({"error": f"Could not fetch live price: {err}"}), 502
     price, _, ticker_err = fetch_live_ticker_price(pair)
     if price is None:
-        price = float(df["close"].iloc[-1])
+        price = float(df[-1]["close"])
 
     risk_amount = current_user.portfolio * 0.015  # 1.5% risk per trade
     quantity = round(risk_amount / price, 6)
@@ -819,8 +828,8 @@ def debug_candles():
     return jsonify({
         "pair": pair, "interval": interval, "success": True,
         "rows_fetched": len(df),
-        "latest_close": float(df["close"].iloc[-1]),
-        "latest_time": str(df["time"].iloc[-1]),
+        "latest_close": float(df[-1]["close"]),
+        "latest_time": str(df[-1].get("time")),
     }), 200
 
 
