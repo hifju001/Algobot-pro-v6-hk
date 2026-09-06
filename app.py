@@ -12,7 +12,6 @@ import json
 import time
 import datetime
 import requests
-import pandas as pd
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
@@ -140,114 +139,190 @@ class Trade(db.Model):
 COINDCX_API = "https://api.coindcx.com"
 
 
-def _aggregate_candles(df, target_interval):
-    """Build unsupported higher timeframes only from genuine lower-timeframe CoinDCX candles."""
-    rules = {"5m": "5min", "30m": "30min", "4h": "4h"}
-    rule = rules.get(target_interval)
-    if not rule or df is None or df.empty:
-        return df
-    x = df.copy().set_index("time")
-    out = x.resample(rule, label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
-    }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+def _aggregate_candles(rows, target_interval):
+    """Aggregate genuine lower-timeframe OHLCV candles using pure Python."""
+    bucket_ms = {"5m": 5*60_000, "30m": 30*60_000, "4h": 4*60*60_000}.get(target_interval)
+    if not bucket_ms or not rows:
+        return rows
+    out, cur = [], None
+    source = rows[0].get("_source", "unknown")
+    for r in sorted(rows, key=lambda x: x["time"]):
+        b = (int(r["time"]) // bucket_ms) * bucket_ms
+        if cur is None or cur["time"] != b:
+            if cur is not None:
+                out.append(cur)
+            cur = {
+                "time": b, "open": float(r["open"]), "high": float(r["high"]),
+                "low": float(r["low"]), "close": float(r["close"]),
+                "volume": float(r.get("volume", 0) or 0), "_source": source
+            }
+        else:
+            cur["high"] = max(cur["high"], float(r["high"]))
+            cur["low"] = min(cur["low"], float(r["low"]))
+            cur["close"] = float(r["close"])
+            cur["volume"] += float(r.get("volume", 0) or 0)
+    if cur is not None:
+        out.append(cur)
     return out
+
+
+def _parse_coindcx_candles(data):
+    rows = []
+    if not isinstance(data, list):
+        return rows
+    for x in data:
+        try:
+            rows.append({
+                "open": float(x["open"]), "high": float(x["high"]),
+                "low": float(x["low"]), "close": float(x["close"]),
+                "volume": float(x.get("volume", 0) or 0),
+                "time": int(float(x["time"])), "_source": "CoinDCX"
+            })
+        except Exception:
+            continue
+    return sorted(rows, key=lambda x: x["time"])
+
+
+def _fetch_binance_candles(pair, interval, limit):
+    """No-key fallback market data from Binance public data API."""
+    symbol = pair.replace("B-", "").replace("_", "").upper()
+    url = "https://data-api.binance.vision/api/v3/klines"
+    r = requests.get(
+        url,
+        params={"symbol": symbol, "interval": interval, "limit": min(1000, max(60, limit))},
+        timeout=8,
+        headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/6.0"},
+    )
+    if r.status_code != 200:
+        return None, f"Binance candles HTTP {r.status_code}: {r.text[:120]}"
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        return None, f"Binance returned no candles for {symbol} {interval}"
+    rows = []
+    for x in data:
+        try:
+            rows.append({
+                "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+                "close": float(x[4]), "volume": float(x[5]),
+                "time": int(x[0]), "_source": "Binance"
+            })
+        except Exception:
+            continue
+    return rows, None
 
 
 def fetch_candles(pair, interval="1h", limit=200):
     """
-    Fetch real CoinDCX Spot candles without authentication.
-    Native Spot intervals documented by CoinDCX: 1m, 15m, 1h, 1d.
-    5m/30m/4h are constructed from real native candles (never synthetic/random).
-    Returns (DataFrame or None, error_message or None).
+    Public no-key candles. CoinDCX is primary.
+    If CoinDCX is unreachable from Render, automatically falls back to Binance.
+    CoinDCX-native: 1m,15m,1h,1d. 5m/30m/4h are aggregated from genuine lower bars.
     """
+    source_map = {
+        "1m": ("1m", min(1000, max(limit, 200))),
+        "5m": ("1m", min(1000, max(limit * 5, 300))),
+        "15m": ("15m", min(1000, max(limit, 200))),
+        "30m": ("15m", min(1000, max(limit * 2, 300))),
+        "1h": ("1h", min(1000, max(limit, 200))),
+        "4h": ("1h", min(1000, max(limit * 4, 400))),
+        "1d": ("1d", min(1000, max(limit, 200))),
+    }
+    if interval not in source_map:
+        return None, f"Unsupported requested interval: {interval}"
+    source_interval, source_limit = source_map[interval]
+    cd_err = None
     try:
-        # Source interval + enough source bars for useful indicator history.
-        source_map = {
-            "1m": ("1m", min(1000, max(limit, 200))),
-            "5m": ("1m", min(1000, max(limit * 5, 300))),
-            "15m": ("15m", min(1000, max(limit, 200))),
-            "30m": ("15m", min(1000, max(limit * 2, 300))),
-            "1h": ("1h", min(1000, max(limit, 200))),
-            "4h": ("1h", min(1000, max(limit * 4, 400))),
-            "1d": ("1d", min(1000, max(limit, 200))),
-        }
-        if interval not in source_map:
-            return None, f"Unsupported requested interval: {interval}"
-        source_interval, source_limit = source_map[interval]
         r = requests.get(
             f"{COINDCX_API}/market_data/candles",
             params={"pair": pair, "interval": source_interval, "limit": source_limit},
-            timeout=12,
-            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/4.0"},
+            timeout=7,
+            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/6.0"},
         )
-        if r.status_code != 200:
-            return None, f"CoinDCX candles HTTP {r.status_code}: {r.text[:160]}"
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return None, f"CoinDCX returned no candles for {pair} {source_interval}"
-        df = pd.DataFrame(data).rename(columns=str.lower)
-        needed = ["open", "high", "low", "close", "volume", "time"]
-        missing = [c for c in needed if c not in df.columns]
-        if missing:
-            return None, f"CoinDCX candle response missing: {','.join(missing)}"
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["time"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="ms", utc=True)
-        df = df.dropna(subset=needed).sort_values("time").reset_index(drop=True)
-        if interval in ("5m", "30m", "4h"):
-            df = _aggregate_candles(df, interval)
-        if len(df) > limit:
-            df = df.tail(limit).reset_index(drop=True)
-        if len(df) < 55:
-            return df, f"Only {len(df)} usable {interval} candles received"
-        return df, None
-    except requests.RequestException as e:
-        return None, f"CoinDCX network error: {e}"
+        if r.status_code == 200:
+            rows = _parse_coindcx_candles(r.json())
+            if rows:
+                if interval in ("5m", "30m", "4h"):
+                    rows = _aggregate_candles(rows, interval)
+                rows = rows[-limit:]
+                if len(rows) >= 55:
+                    return rows, None
+                cd_err = f"CoinDCX only returned {len(rows)} usable {interval} candles"
+            else:
+                cd_err = f"CoinDCX returned no usable candles for {pair} {source_interval}"
+        else:
+            cd_err = f"CoinDCX candles HTTP {r.status_code}: {r.text[:100]}"
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        cd_err = f"CoinDCX {type(e).__name__}: {e}"
+
+    # Fallback supports these requested intervals directly.
+    try:
+        rows, b_err = _fetch_binance_candles(pair, interval, limit)
+        if rows and len(rows) >= 55:
+            return rows, None
+        return rows, f"{cd_err}; fallback: {b_err or 'insufficient Binance candles'}"
+    except Exception as e:
+        return None, f"{cd_err}; Binance fallback {type(e).__name__}: {e}"
 
 
 def fetch_all_tickers():
-    """Fetch CoinDCX public ticker once and return market->quote mapping."""
+    """CoinDCX ticker primary; no-key Binance ticker fallback."""
+    cd_err = None
     try:
         r = requests.get(
-            f"{COINDCX_API}/exchange/ticker", timeout=12,
-            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/5.0"}
+            f"{COINDCX_API}/exchange/ticker", timeout=7,
+            headers={"Accept": "application/json", "User-Agent": "AlgoBot-Pro-v6/6.0"}
+        )
+        if r.status_code == 200:
+            rows = r.json()
+            out = {"__SOURCE__": "CoinDCX"}
+            if isinstance(rows, list):
+                for row in rows:
+                    market = str(row.get("market", "")).upper()
+                    if not market:
+                        continue
+                    try:
+                        price = float(row.get("last_price"))
+                    except Exception:
+                        continue
+                    ts = None
+                    try:
+                        v = float(row.get("timestamp"))
+                        if v > 1e12: v /= 1000.0
+                        ts = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+                    except Exception:
+                        pass
+                    out[market] = (price, ts)
+                if len(out) > 1:
+                    return out, None
+            cd_err = "CoinDCX ticker returned invalid data"
+        else:
+            cd_err = f"CoinDCX ticker HTTP {r.status_code}"
+    except Exception as e:
+        cd_err = f"CoinDCX ticker {type(e).__name__}: {e}"
+
+    try:
+        r = requests.get(
+            "https://data-api.binance.vision/api/v3/ticker/price",
+            timeout=7, headers={"Accept":"application/json","User-Agent":"AlgoBot-Pro-v6/6.0"}
         )
         if r.status_code != 200:
-            return {}, f"CoinDCX ticker HTTP {r.status_code}: {r.text[:120]}"
-        rows = r.json()
-        if not isinstance(rows, list):
-            return {}, "CoinDCX ticker returned non-list response"
-        out = {}
-        for row in rows:
-            market = str(row.get("market", "")).upper()
-            if not market:
-                continue
+            return {}, f"{cd_err}; Binance ticker HTTP {r.status_code}"
+        data = r.json()
+        out = {"__SOURCE__": "Binance"}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for row in data if isinstance(data, list) else []:
             try:
-                price = float(row.get("last_price"))
+                out[str(row["symbol"]).upper()] = (float(row["price"]), now)
             except Exception:
                 continue
-            ts = None
-            raw_ts = row.get("timestamp")
-            if raw_ts is not None:
-                try:
-                    v = float(raw_ts)
-                    if v > 1e12:
-                        v /= 1000.0
-                    ts = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
-                except Exception:
-                    ts = None
-            out[market] = (price, ts)
-        return out, None
-    except requests.RequestException as e:
-        return {}, f"CoinDCX ticker network error: {e}"
+        if len(out) > 1:
+            return out, None
+        return {}, f"{cd_err}; Binance ticker returned invalid data"
     except Exception as e:
-        return {}, f"{type(e).__name__}: {e}"
+        return {}, f"{cd_err}; Binance ticker {type(e).__name__}: {e}"
 
 
 def fetch_live_ticker_price(pair, ticker_map=None):
-    """Return current public CoinDCX Spot price; reuses ticker_map when supplied."""
     market = pair.replace("B-", "").replace("_", "").upper()
     if ticker_map is None:
         ticker_map, err = fetch_all_tickers()
@@ -259,67 +334,64 @@ def fetch_live_ticker_price(pair, ticker_map=None):
     return row[0], row[1], None
 
 
-# ─────────────────────────────────────────────
-# REAL INDICATORS — pure pandas, no external TA library needed
-# ─────────────────────────────────────────────
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def _ema_values(values, period):
+    if not values:
+        return []
+    k = 2.0 / (period + 1.0)
+    out = [float(values[0])]
+    for v in values[1:]:
+        out.append(float(v) * k + out[-1] * (1.0 - k))
+    return out
 
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, 1e-9)
-    return 100 - (100 / (1 + rs))
+def _rsi_last(values, period=14):
+    if len(values) <= period:
+        return 50.0
+    diffs = [values[i] - values[i-1] for i in range(1, len(values))]
+    recent = diffs[-period:]
+    gain = sum(max(d, 0) for d in recent) / period
+    loss = sum(max(-d, 0) for d in recent) / period
+    if loss <= 1e-12:
+        return 100.0 if gain > 0 else 50.0
+    rs = gain / loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-
-# ─────────────────────────────────────────────
-# REAL SIGNAL ENGINE — Confluence strategy on real prices
-# This is what makes paper trading trustworthy: same math, real inputs.
-# ─────────────────────────────────────────────
-def compute_signal(df):
-    if df is None or len(df) < 55:
+def compute_signal(rows):
+    if rows is None or len(rows) < 55:
         return {"action": "WAIT", "confidence": 0, "reason": "Insufficient real data yet"}
 
-    close = df["close"]
-    e9, e21, e50 = ema(close, 9), ema(close, 21), ema(close, 50)
-    r = rsi(close, 14)
-    macd_line, signal_line, hist = macd(close)
+    close = [float(x["close"]) for x in rows]
+    e9 = _ema_values(close, 9)
+    e21 = _ema_values(close, 21)
+    e50 = _ema_values(close, 50)
+    ef = _ema_values(close, 12)
+    es = _ema_values(close, 26)
+    macd_line = [a-b for a,b in zip(ef, es)]
+    signal_line = _ema_values(macd_line, 9)
+    hist = [a-b for a,b in zip(macd_line, signal_line)]
 
-    last_e9, last_e21, last_e50 = e9.iloc[-1], e21.iloc[-1], e50.iloc[-1]
-    last_r = r.iloc[-1]
-    last_hist = hist.iloc[-1]
-    price = close.iloc[-1]
+    last_e9, last_e21, last_e50 = e9[-1], e21[-1], e50[-1]
+    last_r = _rsi_last(close, 14)
+    last_hist = hist[-1]
+    price = close[-1]
 
-    bull, bear, total = 0, 0, 4
+    bull, bear, total = 0.0, 0.0, 4.0
     reasons = []
-
     if last_e9 > last_e21 > last_e50:
         bull += 1; reasons.append("EMA uptrend")
     elif last_e9 < last_e21 < last_e50:
         bear += 1; reasons.append("EMA downtrend")
-
     if last_hist > 0:
         bull += 1; reasons.append("MACD bullish")
     elif last_hist < 0:
         bear += 1; reasons.append("MACD bearish")
-
     if 45 < last_r < 65:
         bull += 1; reasons.append(f"RSI {last_r:.0f} healthy")
     elif last_r <= 35:
         bull += 0.5; reasons.append(f"RSI {last_r:.0f} oversold")
     elif last_r >= 70:
         bear += 0.5; reasons.append(f"RSI {last_r:.0f} overbought")
-
     if price > last_e9:
         bull += 1
     else:
@@ -330,11 +402,8 @@ def compute_signal(df):
     action = "BUY" if bull > bear else "SELL" if bear > bull else "WAIT"
     if confidence < 50:
         action = "WAIT"
-
     return {
-        "action": action,
-        "confidence": confidence,
-        "price": float(price),
+        "action": action, "confidence": confidence, "price": float(price),
         "reason": ", ".join(reasons) if reasons else "No clear setup",
         "rsi": round(float(last_r), 1),
     }
@@ -527,7 +596,7 @@ def scan(current_user):
         # in memory at once was crashing the worker with SIGSEGV (exit 139).
         candle_results = {}
         jobs = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             for pair in WATCHLIST:
                 jobs[pool.submit(fetch_candles, pair, interval, 200)] = (pair, "primary")
                 jobs[pool.submit(fetch_candles, pair, confirm_interval, 200)] = (pair, "confirm")

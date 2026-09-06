@@ -254,7 +254,7 @@ canvas{width:100%!important;}
     }
     container.innerHTML = res.signals.map(s => {
       const badgeColor = s.action === 'BUY' ? 'var(--gn)' : s.action === 'SELL' ? 'var(--rd)' : 'var(--yl)';
-      const srcColor = s.data_source && s.data_source.startsWith('CoinDCX') ? 'var(--gn)' : 'var(--rd)';
+      const srcColor = s.data_source && s.data_source.includes('public data') ? 'var(--gn)' : 'var(--rd)';
       return `<div class="tr" style="margin-bottom:6px;">
         <span style="color:var(--cy);font-weight:700;min-width:90px;">${s.pair}</span>
         <span style="color:${badgeColor};font-weight:700;">${s.action}</span>
@@ -700,8 +700,8 @@ const STRATS=[
   {id:5,name:'Liquidity Sweep',wr:.67,lb:1},
 ];
 const CPAIRS=[
-  {sym:'BTC/USDT',ex:'CoinDCX',base:62000,ml:10},
-  {sym:'ETH/USDT',ex:'CoinDCX',base:3200,ml:10},
+  {sym:'BTC/USDT',ex:(x.data_source||'Public Feed').replace(' public data',''),base:62000,ml:10},
+  {sym:'ETH/USDT',ex:(x.data_source||'Public Feed').replace(' public data',''),base:3200,ml:10},
   {sym:'SOL/USDT',ex:'Delta',base:148,ml:5},
   {sym:'BNB/USDT',ex:'Delta',base:580,ml:8},
   {sym:'MATIC/USDT',ex:'Delta',base:.92,ml:5},
@@ -1199,15 +1199,15 @@ async function scanNow(){
       {l:`RSI${x.rsi??'-'}`,c:'neut'},
       {l:`TF ${x.actual_interval||tf}`,c:'liq'},
       {l:`CONF ${x.confirm_actual_interval||ctf}`,c:x.confirmation_ok?'bull':'bear'},
-      {l:x.data_source&&x.data_source.startsWith('CoinDCX')?'LIVE✓':'DATA✗',c:x.data_source&&x.data_source.startsWith('CoinDCX')?'bull':'bear'}
+      {l:x.data_source&&x.data_source.includes('public data')?'LIVE✓':'DATA✗',c:x.data_source&&x.data_source.includes('public data')?'bull':'bear'}
     ];
     const li=aiLev(conf,S.stratId,'med',10);
     const liqP=li.lev>1?(action==='BUY'?price*(1-1/li.lev*.9):price*(1+1/li.lev*.9)):0;
-    return {pair:x.display_pair||x.pair,apiPair:x.pair,ex:'CoinDCX',price,action,conf,filters,sl,tp,li,liqP,vl:'live',r:x.rsi,sa:{ok:x.confirmation_ok!==false,reason:`${x.reason} · ${x.actual_interval||tf} + ${x.confirm_actual_interval||ctf}`},blocked:x.data_source!=='CoinDCX public ticker + candles',currency:'USDT',feedAge:x.feed_age_seconds};
+    return {pair:x.display_pair||x.pair,apiPair:x.pair,ex:(x.data_source||'Public Feed').replace(' public data',''),price,action,conf,filters,sl,tp,li,liqP,vl:'live',r:x.rsi,sa:{ok:x.confirmation_ok!==false,reason:`${x.reason} · ${x.actual_interval||tf} + ${x.confirm_actual_interval||ctf}`},blocked:!(x.data_source&&x.data_source.includes('public data')),currency:'USDT',feedAge:x.feed_age_seconds};
   });
   renderSigs(sigs);
   const act=sigs.filter(s=>s.action!=='WAIT').length;
-  log(`[${S.mode.toUpperCase()}] REAL CoinDCX scan: ${act} signals | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf}`,'ok');
+  log(`[${S.mode.toUpperCase()}] REAL public-feed scan: ${act} signals | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf}`,'ok');
 }
 function toggleBot(){
   S.botOn=!S.botOn;

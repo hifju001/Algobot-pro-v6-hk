@@ -1,3 +1,16 @@
+# AlgoBot Pro v6 — V6 Render-safe dual public feed
+
+This build addresses repeated Render HTTP 502 errors during live crypto scans.
+
+- Removes pandas from the live scan path to reduce Render memory use.
+- CoinDCX remains the primary no-key public source.
+- If CoinDCX is unreachable or rejects the Render server, Binance public `data-api.binance.vision` automatically supplies live ticker/candles.
+- No API key is required for either public feed.
+- Real MTF mapping remains: Scalping 1m+5m, Intraday 15m+1h, Options 5m+15m, Swing 4h+1d.
+- Signal calculations use only genuine OHLCV candles.
+- Gunicorn is reduced to 2 threads and a 90s timeout for stability on small Render instances.
+- `/api/feed-test` remains available for diagnostics.
+
 # AlgoBot Pro v6 — V4 no-key live-paper feed fix
 
 This build fixes the V3 live crypto scanner.
