@@ -1,3 +1,23 @@
+# AlgoBot Pro v6 — V9 Auto-80 + Journals + Selectable Live Strategies
+
+This build extends the stable V8/V7 live-paper core.
+
+## New in V9
+- Auto Paper entries are hard-gated at **80% confidence or higher**. The Signal Display filter cannot lower the auto-entry threshold.
+- Every live scan result (BUY / SELL / WAIT / blocked reason) is stored in a persistent **Signal Journal** table.
+- Every paper trade ENTRY and EXIT is stored in a **Trade Journal** table.
+- Signals screen has one-click CSV downloads for both journals.
+- Live strategy selector works with every crypto trading mode (Scalping / Intraday / Options / Swing).
+- Four real-candle strategies are available: Confluence MTF, Trend + Momentum, Volume Breakout, Trend Pullback.
+- Primary + confirmation timeframe use the same selected strategy.
+- No strategy is advertised as a guaranteed 75%+ winner. V9 is intentionally built to measure the real win rate over your 15–30 day paper test.
+
+## Important for a 15–30 day journal
+Set a persistent `DATABASE_URL` (for example managed PostgreSQL) in Render. If Render falls back to local SQLite, the service filesystem can be replaced on redeploy/restart and journal history may be lost.
+
+## India paper trading
+This build still blocks synthetic India signals. Official NSE real-time data is a licensed product; for reliable scalping/options paper validation, use a broker/data-vendor market-data session (market data only is enough; live order execution can stay disabled). Do not judge Indian scalping from an unofficial delayed webpage feed.
+
 # AlgoBot Pro v6 — V7 Stable Core / Live Paper Fix
 
 This build fixes the frontend freeze and backend list/DataFrame mismatch found in the deployed V6 repository.
@@ -102,3 +122,11 @@ It will appear on the home screen with an icon and open full-screen like a nativ
 - SQLite is fine for one person testing; for real multi-user production, migrate to Render's
   managed PostgreSQL (a few line changes in `app.py`'s `SQLALCHEMY_DATABASE_URI`)
 - Add rate-limiting on `/api/login` before this is public, to prevent brute-force attempts
+
+## V8 Auto Paper Trading
+- Start Bot + Auto Paper ON automatically opens PAPER positions from real public-feed BUY/SELL signals that meet Min Confidence and filters.
+- Automatic execution is deliberately PAPER ONLY. Switching to LIVE requires stopping the bot and no automatic real-money orders are placed by this V8 path.
+- One open position per pair, max-position and daily-loss guards, plus cooldown prevent duplicate entries.
+- Open paper positions are monitored on each fresh market scan and close only when observed real public-feed price reaches SL or TP.
+- Random win/loss closing is removed from the main Signals paper-trading path.
+- Closed paper trades are persisted through /api/trades; open positions remain browser-session state in this version.

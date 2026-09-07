@@ -246,7 +246,8 @@ canvas{width:100%!important;}
     container.innerHTML = '<div style="color:var(--m1);font-size:11px;">Fetching real prices from CoinDCX...</div>';
     const tf = document.getElementById('sigTF')?.value || MODES[S.mode].primaryTF || '5m';
     const ctf = MODES[S.mode].confirmTF || '15m';
-    const res = await algoApi('/scan?interval=' + encodeURIComponent(tf) + '&confirm_interval=' + encodeURIComponent(ctf));
+    const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+    const res = await algoApi('/scan?interval=' + encodeURIComponent(tf) + '&confirm_interval=' + encodeURIComponent(ctf) + '&strategy=' + encodeURIComponent(strategy) + '&trade_mode=' + encodeURIComponent(S.mode));
     if(!res){ return; }
     if(res.error){
       container.innerHTML = `<div style="color:var(--rd);font-size:11px;">${res.error}</div>`;
@@ -460,13 +461,20 @@ canvas{width:100%!important;}
   <div class="fr mb12" style="align-items:flex-end;">
     <div class="fg" style="max-width:130px;"><label>Timeframe</label>
       <select id="sigTF" onchange="manualTFOverride()"><option>1m</option><option>5m</option><option selected>15m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option></select><div id="tfConfirm" style="font-size:9px;color:var(--m1);margin-top:4px">Confirm: 1h</div></div>
-    <div class="fg" style="max-width:140px;"><label>Min Confidence</label>
-      <select id="minConf"><option value="50">50%+</option><option value="65" selected>65%+</option><option value="75">75%+</option><option value="85">85%+</option></select></div>
+    <div class="fg" style="max-width:180px;"><label>Live Strategy</label>
+      <select id="liveStrategy" onchange="onLiveStrategyChange()"><option value="confluence" selected>Confluence MTF</option><option value="trend_momentum">Trend + Momentum</option><option value="breakout">Volume Breakout</option><option value="pullback">Trend Pullback</option></select></div>
+    <div class="fg" style="max-width:140px;"><label>Signal Display</label>
+      <select id="minConf"><option value="50">50%+</option><option value="65" selected>65%+</option><option value="75">75%+</option><option value="80">80%+</option><option value="85">85%+</option></select></div>
     <div class="fg" style="max-width:160px;"><label>Sentiment Filter</label>
       <select id="sentFilter"><option value="on" selected>ON — skip bad mood</option><option value="off">OFF</option></select></div>
+    <div class="fg" style="max-width:135px;"><label>Auto Paper</label>
+      <select id="autoPaper"><option value="on" selected>ON — auto trade</option><option value="off">OFF — signals only</option></select></div>
     <div><button class="btn btn-c" id="botBtn" onclick="toggleBot()">▶ Start Bot</button></div>
     <div><button class="btn btn-gh" onclick="scanNow()">⟳ Scan</button></div>
+    <div><button class="btn btn-gh" onclick="downloadJournal('signals')">⬇ Signal Journal</button></div>
+    <div><button class="btn btn-gh" onclick="downloadJournal('trades')">⬇ Trade Journal</button></div>
   </div>
+  <div class="alert a-w mb8">🤖 Auto Paper entry is fixed at <b>80% confidence or higher</b>. Signal Display only controls what you see; it cannot lower the auto-entry threshold.</div>
   <div class="alert a-p mb12" id="sigModeAlert">⚡ Scalping Signals — Technical + Sentiment + Liquidity filters</div>
   <div id="sigGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;"></div>
   <div class="stit mt12">Engine Log</div>
@@ -691,6 +699,14 @@ const MODES={
   swing:{label:'🌊 Swing',sl:4,tp:12,maxPos:3,tf:'4h + 1d confirm',primaryTF:'4h',confirmTF:'1d',cap:3},
   india:{label:'🇮🇳 India',sl:.8,tp:1.8,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',cap:3},
 };
+const LIVE_STRATEGIES={
+  confluence:{name:'Confluence MTF',desc:'EMA + MACD + RSI + VWAP + volume'},
+  trend_momentum:{name:'Trend + Momentum',desc:'EMA structure + MACD + RSI + VWAP + volume'},
+  breakout:{name:'Volume Breakout',desc:'20-bar breakout + volume expansion + trend + momentum'},
+  pullback:{name:'Trend Pullback',desc:'EMA trend + controlled pullback + momentum resumption + VWAP'},
+};
+const AUTO_ENTRY_CONFIDENCE=80;
+
 const STRATS=[
   {id:0,name:'Smart Trend+Liq',wr:.66,lb:1},
   {id:1,name:'Supertrend+VWAP',wr:.64,lb:0},
@@ -763,7 +779,8 @@ let S={
   capital:100000,portfolio:100000,
   trades:[],positions:[],optTrades:[],equityCurve:[100000],
   botOn:false,botTimer:null,
-  mode:'scalp',stratId:4,
+  autoCooldown:{},
+  mode:'scalp',stratId:4,liveStrategy:'confluence',
   levOn:false,levMode:'ai',
   dailyLoss:0,
   cfg:{slPct:.5,tpPct:1.0,riskPct:1.5,maxPos:5,dailyLimit:3000},
@@ -978,7 +995,7 @@ function renderSigs(sigs){
     return`<div class="sig" style="${dim?'opacity:.4':''}">
       <div class="sg ${s.action.toLowerCase()}"></div>
       <div class="sig-top">
-        <div><div class="sig-pair">${s.pair}</div><div class="sig-sub">${s.ex} · ${s.vl.toUpperCase()} · ${M.label}</div></div>
+        <div><div class="sig-pair">${s.pair}</div><div class="sig-sub">${s.ex} · ${s.vl.toUpperCase()} · ${M.label} · ${LIVE_STRATEGIES[s.strategy]?.name||s.strategy||'Confluence'}</div></div>
         <span class="sbadge ${s.action}">${s.action}</span>
       </div>
       <div class="smeta"><span><b>${s.price.toLocaleString('en-US',{maximumFractionDigits:4})}</b> ${s.currency||'₹'}</span><span>SL:<b style="color:var(--rd)">${s.sl.toFixed(4)}</b></span><span>TP:<b style="color:var(--gn)">${s.tp.toFixed(4)}</b></span>${s.feedAge!=null?`<span>Age:${s.feedAge}s</span>`:''}</div>
@@ -1141,33 +1158,129 @@ function scanSwing(){
 // PAPER TRADING
 // ══════════════════════════════════════════
 function paperTrade(pair,price,side,sl,tp,lev,ex,tradeMode){
-  if(S.positions.find(p=>p.pair===pair)){log(`⚠️ Already open: ${pair}`,'warn');return;}
-  if(S.positions.length>=S.cfg.maxPos){log(`⚠️ Max positions reached`,'warn');return;}
-  if(S.dailyLoss>=S.cfg.dailyLimit){log('🚫 Daily loss limit hit','err');return;}
-  const M=MODES[tradeMode]||MODES[S.mode];
-  const margin=S.portfolio*S.cfg.riskPct/100/(M.sl/100);
-  const eff=margin*lev,qty=eff/price;
-  const liqP=lev>1?(side==='BUY'?price*(1-1/lev*.9):price*(1+1/lev*.9)):0;
-  const pos={pair,price,side,sl,tp,lev,margin,eff,qty,liqP,ex,tradeMode,sentScore:S.sent.score,t:ts()};
-  S.positions.push(pos);
-  log(`✅ ${side} ${pair}[${tradeMode}] ₹${price.toFixed(2)} ${lev}x Margin:₹${margin.toFixed(0)} Pos:₹${eff.toFixed(0)}${lev>1?' Liq:₹'+liqP.toFixed(0):''}`,lev>1?'lev':'ok');
-  const pWin=STRATS[S.stratId].wr;
-  setTimeout(()=>closePos(pos,pWin),tradeMode==='swing'?8000+Math.random()*12000:3000+Math.random()*10000);
-  updDash();
+  // Manual paper button now uses the same REAL-price lifecycle as Auto Paper.
+  const sig={pair,apiPair:pair,price,action:side,sl,tp,li:{lev:lev||1},ex,tradeMode:tradeMode||S.mode,conf:100,blocked:false,currency:'USDT'};
+  openRealPaperPosition(sig,'MANUAL');
 }
-function closePos(pos,pWin){
-  const idx=S.positions.indexOf(pos);if(idx===-1)return;
-  const won=Math.random()<pWin;
-  const exit=won?(pos.side==='BUY'?pos.tp:pos.sl):(pos.side==='BUY'?pos.sl:pos.tp);
+
+function autoPaperIsOn(){
+  return (document.getElementById('autoPaper')?.value||'on')==='on';
+}
+function accountIsPaper(){
+  return (document.getElementById('modeS')?.value||'paper')==='paper';
+}
+function positionKey(s){ return `${s.pair}|${s.tradeMode||S.mode}`; }
+
+function openRealPaperPosition(s,source='AUTO'){
+  if(!accountIsPaper()){
+    log(`🚫 ${source} execution skipped: account is LIVE. Auto Paper never places real-money orders.`,'warn');
+    return false;
+  }
+  if(!s || !s.pair || !Number(s.price) || !['BUY','SELL'].includes(s.action)) return false;
+  if(S.positions.find(p=>p.pair===s.pair)){
+    log(`⚠️ ${source} skipped ${s.pair}: position already open`,'warn');
+    return false;
+  }
+  if(S.positions.length>=S.cfg.maxPos){ log(`⚠️ ${source} skipped: max positions reached`,'warn'); return false; }
+  if(S.dailyLoss>=S.cfg.dailyLimit){ log('🚫 Daily loss limit hit — Auto Paper blocked','err'); return false; }
+
+  const M=MODES[s.tradeMode||S.mode]||MODES[S.mode];
+  const lev=Math.max(1,Number(s.li?.lev||1));
+  const margin=S.portfolio*S.cfg.riskPct/100/(M.sl/100);
+  const eff=margin*lev;
+  const qty=eff/Number(s.price);
+  const pos={
+    pair:s.pair, apiPair:s.apiPair||s.pair, price:Number(s.price), side:s.action,
+    sl:Number(s.sl), tp:Number(s.tp), lev, margin, eff, qty,
+    ex:s.ex||'Public Feed', tradeMode:s.tradeMode||S.mode,
+    confidence:Number(s.conf||0), strategy:s.strategy||S.liveStrategy||'confluence',
+    sentScore:S.sent.score, t:ts(), openedAt:Date.now(), source:'REAL_PUBLIC_FEED', autoSource:source
+  };
+  S.positions.push(pos);
+  S.autoCooldown[positionKey(pos)]=Date.now();
+  log(`🤖 ${source} PAPER ${pos.side} ${pos.pair} @ ${pos.price.toFixed(4)} | ${pos.confidence}% | ${LIVE_STRATEGIES[pos.strategy]?.name||pos.strategy} | SL ${pos.sl.toFixed(4)} | TP ${pos.tp.toFixed(4)}`,'ok');
+  algoApi('/trade-events',{method:'POST',body:JSON.stringify({event:'ENTRY',pair:pos.apiPair||pos.pair,side:pos.side,price:pos.price,entry:pos.price,leverage:pos.lev,confidence:pos.confidence,strategy:pos.strategy,trade_mode:pos.tradeMode,source:pos.ex,reason:source+' AUTO/PAPER ENTRY'})}).then(r=>{if(r?.error)log('⚠️ Entry journal save failed: '+r.error,'warn');});
+  updDash();
+  return true;
+}
+
+async function closeRealPaperPosition(pos,exit,reason){
+  const idx=S.positions.indexOf(pos); if(idx===-1) return;
+  exit=Number(exit);
   const pct=pos.side==='BUY'?(exit-pos.price)/pos.price:(pos.price-exit)/pos.price;
   const pnl=pct*pos.eff;
-  const reason=won?'Take Profit ✅':'Stop Loss ❌';
   S.positions.splice(idx,1);
-  S.trades.push({pair:pos.pair,side:pos.side,entry:pos.price,exit,pnl,reason,lev:pos.lev,tradeMode:pos.tradeMode,sentScore:pos.sentScore,t:ts()});
-  S.portfolio+=pnl;if(pnl<0)S.dailyLoss+=Math.abs(pnl);
+  const trade={pair:pos.pair,side:pos.side,entry:pos.price,exit,pnl,reason,lev:pos.lev,tradeMode:pos.tradeMode,strategy:pos.strategy,confidence:pos.confidence,sentScore:pos.sentScore,t:ts()};
+  S.trades.push(trade);
+  S.portfolio+=pnl;
+  if(pnl<0) S.dailyLoss+=Math.abs(pnl);
   S.equityCurve.push(S.portfolio);
-  log(`${reason}[${pos.tradeMode}] ${pos.pair} ${pos.lev}x P&L:${pnl>=0?'+':''}₹${pnl.toFixed(2)}`,pnl>=0?'ok':'err');
+  log(`${reason} [${pos.tradeMode}] ${pos.pair} P&L:${pnl>=0?'+':''}₹${pnl.toFixed(2)} | exit ${exit.toFixed(4)}`,pnl>=0?'ok':'err');
   updDash();
+  // Persist only CLOSED paper trades. Failure here must not break local paper execution.
+  try{
+    const r=await algoApi('/trades',{method:'POST',body:JSON.stringify({pair:pos.apiPair||pos.pair,side:pos.side,entry:pos.price,exit,leverage:pos.lev,pnl,reason,trade_mode:pos.tradeMode})});
+    if(r?.error) log('⚠️ Trade history save failed: '+r.error,'warn');
+    const j=await algoApi('/trade-events',{method:'POST',body:JSON.stringify({event:'EXIT',pair:pos.apiPair||pos.pair,side:pos.side,price:exit,entry:pos.price,exit,pnl,leverage:pos.lev,confidence:pos.confidence,strategy:pos.strategy,trade_mode:pos.tradeMode,source:pos.ex,reason})});
+    if(j?.error) log('⚠️ Exit journal save failed: '+j.error,'warn');
+  }catch(e){ log('⚠️ Trade history save failed: '+e.message,'warn'); }
+}
+
+function monitorRealPaperPositions(sigs){
+  const priceMap={};
+  (sigs||[]).forEach(s=>{ if(Number(s.price)>0){ priceMap[s.pair]=Number(s.price); if(s.apiPair) priceMap[s.apiPair]=Number(s.price); } });
+  [...S.positions].filter(p=>p.source==='REAL_PUBLIC_FEED').forEach(pos=>{
+    const px=priceMap[pos.pair] ?? priceMap[pos.apiPair];
+    if(!px) return;
+    if(pos.side==='BUY'){
+      if(px<=pos.sl) closeRealPaperPosition(pos,px,'Stop Loss ❌');
+      else if(px>=pos.tp) closeRealPaperPosition(pos,px,'Take Profit ✅');
+    }else{
+      if(px>=pos.sl) closeRealPaperPosition(pos,px,'Stop Loss ❌');
+      else if(px<=pos.tp) closeRealPaperPosition(pos,px,'Take Profit ✅');
+    }
+  });
+}
+
+function autoPaperFromSignals(sigs){
+  if(!S.botOn || !autoPaperIsOn()) return;
+  if(!accountIsPaper()){
+    log('⚠️ Auto Paper is disabled while account mode is LIVE. Signals continue, but no automatic real orders are sent.','warn');
+    return;
+  }
+  const autoMin=AUTO_ENTRY_CONFIDENCE;
+  const cooldownMs=Math.max(60_000, parseInt(document.getElementById('scanEvery')?.value||'60')*1000*2);
+  for(const s of (sigs||[])){
+    if(!['BUY','SELL'].includes(s.action) || s.blocked || Number(s.conf)<autoMin) continue;
+    const key=positionKey({...s,tradeMode:S.mode});
+    const last=S.autoCooldown[key]||0;
+    if(Date.now()-last < cooldownMs) continue;
+    if(S.positions.find(p=>p.pair===s.pair)) continue;
+    openRealPaperPosition({...s,tradeMode:S.mode},'AUTO');
+  }
+}
+
+function onLiveStrategyChange(){
+  S.liveStrategy=document.getElementById('liveStrategy')?.value||'confluence';
+  const M=MODES[S.mode];
+  const sa=document.getElementById('sigModeAlert');
+  if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}%`;
+  log(`Strategy selected: ${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}`,'ok');
+  scanNow();
+}
+
+async function downloadJournal(kind){
+  const path=kind==='signals'?'/api/export/signals.csv':'/api/export/trades.csv';
+  try{
+    const res=await fetch(path,{headers:{'Authorization':'Bearer '+ALGO_TOKEN}});
+    if(res.status===401){algoLogout();return;}
+    if(!res.ok){const t=await res.text();throw new Error(`HTTP ${res.status}: ${t.slice(0,120)}`);}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);const a=document.createElement('a');
+    a.href=url;a.download=kind==='signals'?'algobot_signal_journal.csv':'algobot_trade_journal.csv';
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    log(`⬇ ${kind==='signals'?'Signal':'Trade'} journal downloaded`,'ok');
+  }catch(e){log('Journal download failed: '+e.message,'err');alert('Journal download failed: '+e.message);}
 }
 
 // ══════════════════════════════════════════
@@ -1182,7 +1295,9 @@ async function scanNow(){
   }
   const tf=document.getElementById('sigTF')?.value||MODES[S.mode].primaryTF||'5m';
   const ctf=MODES[S.mode].confirmTF||'15m';
-  const res=await algoApi('/scan?interval='+encodeURIComponent(tf)+'&confirm_interval='+encodeURIComponent(ctf));
+  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+  S.liveStrategy=strategy;
+  const res=await algoApi('/scan?interval='+encodeURIComponent(tf)+'&confirm_interval='+encodeURIComponent(ctf)+'&strategy='+encodeURIComponent(strategy)+'&trade_mode='+encodeURIComponent(S.mode));
   if(!res||res.error){
     const msg=(res?.error||'no response from server');
     log('Real scan failed: '+msg,'err');
@@ -1203,11 +1318,13 @@ async function scanNow(){
     ];
     const li=aiLev(conf,S.stratId,'med',10);
     const liqP=li.lev>1?(action==='BUY'?price*(1-1/li.lev*.9):price*(1+1/li.lev*.9)):0;
-    return {pair:x.display_pair||x.pair,apiPair:x.pair,ex:(x.data_source||'Public Feed').replace(' public data',''),price,action,conf,filters,sl,tp,li,liqP,vl:'live',r:x.rsi,sa:{ok:x.confirmation_ok!==false,reason:`${x.reason} · ${x.actual_interval||tf} + ${x.confirm_actual_interval||ctf}`},blocked:!(x.data_source&&x.data_source.includes('public data')),currency:'USDT',feedAge:x.feed_age_seconds};
+    return {pair:x.display_pair||x.pair,apiPair:x.pair,ex:(x.data_source||'Public Feed').replace(' public data',''),price,action,conf,filters,sl,tp,li,liqP,vl:'live',r:x.rsi,strategy:x.strategy||strategy,sa:{ok:x.confirmation_ok!==false,reason:`${x.reason} · ${x.actual_interval||tf} + ${x.confirm_actual_interval||ctf}`},blocked:!(x.data_source&&x.data_source.includes('public data')),currency:'USDT',feedAge:x.feed_age_seconds};
   });
   renderSigs(sigs);
+  monitorRealPaperPositions(sigs);
+  autoPaperFromSignals(sigs);
   const act=sigs.filter(s=>s.action!=='WAIT').length;
-  log(`[${S.mode.toUpperCase()}] REAL public-feed scan: ${act} signals | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf}`,'ok');
+  log(`[${S.mode.toUpperCase()}] ${LIVE_STRATEGIES[strategy]?.name||strategy} scan: ${act} actionable | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf} | Auto≥${AUTO_ENTRY_CONFIDENCE}%`,'ok');
 }
 function toggleBot(){
   S.botOn=!S.botOn;
@@ -1217,7 +1334,7 @@ function toggleBot(){
     badge.innerHTML='<span class="pulse">●</span> RUNNING';badge.className='hbadge live';
     const iv=parseInt(document.getElementById('scanEvery')?.value||'60')*1000;
     S.botTimer=setInterval(()=>{scanNow();},iv);
-    scanNow();log(`🤖 Bot started | ${S.mode} | Lev:${S.levOn?S.levMode:'OFF'} | Sent:ON | Liq:ON`,'ok');
+    scanNow();log(`🤖 Bot started | ${S.mode} | Auto Paper:${autoPaperIsOn()?'ON':'OFF'} | Lev:${S.levOn?S.levMode:'OFF'}`,'ok');
   }else{
     btn.textContent='▶ Start Bot';btn.className='btn btn-c';
     badge.innerHTML='<span class="pulse">●</span> PAPER';badge.className='hbadge paper';
@@ -1265,7 +1382,7 @@ function switchMode(m){
   const rt=document.getElementById('rTP');if(rt)rt.value=M.tp;
   const rm=document.getElementById('rMax');if(rm)rm.value=M.maxPos;
   el('dMode',M.label);el('dModeSub',m==='india'?'NSE/BSE':'Crypto');
-  const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | SL:${M.sl}% | TP:${M.tp}% | REAL CoinDCX candles`;
+  const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}% | SL:${M.sl}% | TP:${M.tp}%`;
   calcRisk();scanNow();
 }
 
@@ -1494,6 +1611,12 @@ async function setLiveMode(){
   const m = document.getElementById('modeS').value;
   const badge = document.getElementById('tradeBadge');
 
+  if(m === 'live' && S.botOn){
+    alert('Stop the bot before switching to LIVE mode. Auto Paper is intentionally isolated from real-money execution.');
+    document.getElementById('modeS').value='paper';
+    return;
+  }
+
   if(m === 'live'){
     const confirmed = confirm(
       '\u26a0\ufe0f You are about to switch to LIVE trading.\n\n' +
@@ -1546,8 +1669,8 @@ safeInit('sentiment', refreshSentiment);
 safeInit('liquidity', scanLiquidity);
 safeInit('brokers', buildBrokerGrid);
 safeInit('signals', ()=>scanNow());
-log('🚀 AlgoBot Pro v6 V7 stable core loaded','ok');
-log('📡 Signals use real public CoinDCX/Binance market candles; no API key required','sent');
+log('🚀 AlgoBot Pro v6 V9 journal + strategy core loaded','ok');
+log('📡 Live signals: CoinDCX/Binance public candles | Strategy selectable | Auto Paper requires ≥80%','sent');
 log('🧯 UI modules are fault-isolated so one module cannot freeze mode switching or Signals','ok');
 log('🇮🇳 India synthetic live signals remain disabled until a reliable real feed is connected','ind');
 </script>

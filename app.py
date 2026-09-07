@@ -13,9 +13,11 @@ import time
 import datetime
 import requests
 import traceback
+import csv
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import OperationalError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -129,6 +131,42 @@ class Trade(db.Model):
             "trade_mode": self.trade_mode,
             "time": self.created_at.isoformat(),
         }
+
+
+class SignalLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    pair = db.Column(db.String(30))
+    action = db.Column(db.String(10))
+    confidence = db.Column(db.Float)
+    price = db.Column(db.Float)
+    strategy = db.Column(db.String(40))
+    trade_mode = db.Column(db.String(20))
+    primary_tf = db.Column(db.String(10))
+    confirm_tf = db.Column(db.String(10))
+    confirm_action = db.Column(db.String(10))
+    data_source = db.Column(db.String(80))
+    reason = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class TradeEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    event = db.Column(db.String(10))  # ENTRY / EXIT
+    pair = db.Column(db.String(30))
+    side = db.Column(db.String(10))
+    price = db.Column(db.Float)
+    entry = db.Column(db.Float)
+    exit_price = db.Column(db.Float)
+    pnl = db.Column(db.Float, default=0)
+    leverage = db.Column(db.Float, default=1)
+    confidence = db.Column(db.Float)
+    strategy = db.Column(db.String(40))
+    trade_mode = db.Column(db.String(20))
+    reason = db.Column(db.String(120))
+    source = db.Column(db.String(80))
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
 
 
 # ─────────────────────────────────────────────
@@ -357,11 +395,33 @@ def _rsi_last(values, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def compute_signal(rows):
+def _sma(values, period):
+    if len(values) < period:
+        return sum(values) / max(1, len(values))
+    return sum(values[-period:]) / period
+
+
+def _vwap_last(rows, period=30):
+    subset = rows[-period:]
+    pv = 0.0
+    vol = 0.0
+    for r in subset:
+        v = float(r.get("volume", 0) or 0)
+        typical = (float(r["high"]) + float(r["low"]) + float(r["close"])) / 3.0
+        pv += typical * v
+        vol += v
+    return pv / vol if vol > 1e-12 else float(subset[-1]["close"])
+
+
+def compute_signal(rows, strategy="confluence"):
+    """Live-candle signal engine. No random inputs are used here."""
     if rows is None or len(rows) < 55:
-        return {"action": "WAIT", "confidence": 0, "reason": "Insufficient real data yet"}
+        return {"action": "WAIT", "confidence": 0, "reason": "Insufficient real data yet", "strategy": strategy}
 
     close = [float(x["close"]) for x in rows]
+    high = [float(x["high"]) for x in rows]
+    low = [float(x["low"]) for x in rows]
+    volume = [float(x.get("volume", 0) or 0) for x in rows]
     e9 = _ema_values(close, 9)
     e21 = _ema_values(close, 21)
     e50 = _ema_values(close, 50)
@@ -371,41 +431,83 @@ def compute_signal(rows):
     signal_line = _ema_values(macd_line, 9)
     hist = [a-b for a,b in zip(macd_line, signal_line)]
 
+    price = close[-1]
     last_e9, last_e21, last_e50 = e9[-1], e21[-1], e50[-1]
     last_r = _rsi_last(close, 14)
     last_hist = hist[-1]
-    price = close[-1]
+    avg_vol = _sma(volume[:-1] if len(volume)>1 else volume, 20)
+    vol_ratio = volume[-1] / avg_vol if avg_vol > 1e-12 else 1.0
+    vwap = _vwap_last(rows, 30)
+    prev20_high = max(high[-21:-1]) if len(high) >= 21 else max(high[:-1])
+    prev20_low = min(low[-21:-1]) if len(low) >= 21 else min(low[:-1])
 
-    bull, bear, total = 0.0, 0.0, 4.0
+    bull = bear = 0.0
+    total = 5.0
     reasons = []
-    if last_e9 > last_e21 > last_e50:
-        bull += 1; reasons.append("EMA uptrend")
-    elif last_e9 < last_e21 < last_e50:
-        bear += 1; reasons.append("EMA downtrend")
-    if last_hist > 0:
-        bull += 1; reasons.append("MACD bullish")
-    elif last_hist < 0:
-        bear += 1; reasons.append("MACD bearish")
-    if 45 < last_r < 65:
-        bull += 1; reasons.append(f"RSI {last_r:.0f} healthy")
-    elif last_r <= 35:
-        bull += 0.5; reasons.append(f"RSI {last_r:.0f} oversold")
-    elif last_r >= 70:
-        bear += 0.5; reasons.append(f"RSI {last_r:.0f} overbought")
-    if price > last_e9:
-        bull += 1
-    else:
-        bear += 1
+
+    if strategy == "trend_momentum":
+        total = 6.0
+        if last_e9 > last_e21 > last_e50: bull += 2; reasons.append("EMA trend up")
+        elif last_e9 < last_e21 < last_e50: bear += 2; reasons.append("EMA trend down")
+        if last_hist > 0: bull += 1; reasons.append("MACD +")
+        elif last_hist < 0: bear += 1; reasons.append("MACD -")
+        if 52 <= last_r <= 68: bull += 1; reasons.append(f"RSI {last_r:.0f} bullish")
+        elif 32 <= last_r <= 48: bear += 1; reasons.append(f"RSI {last_r:.0f} bearish")
+        if price > vwap: bull += 1; reasons.append("above VWAP")
+        elif price < vwap: bear += 1; reasons.append("below VWAP")
+        if vol_ratio >= 1.15: bull += .5; bear += .5; reasons.append(f"volume {vol_ratio:.1f}x")
+        if price > last_e9: bull += .5
+        elif price < last_e9: bear += .5
+    elif strategy == "breakout":
+        total = 6.0
+        if price > prev20_high: bull += 2; reasons.append("20-bar breakout")
+        elif price < prev20_low: bear += 2; reasons.append("20-bar breakdown")
+        if last_e21 > last_e50: bull += 1; reasons.append("EMA trend up")
+        elif last_e21 < last_e50: bear += 1; reasons.append("EMA trend down")
+        if last_hist > 0: bull += 1; reasons.append("MACD confirms")
+        elif last_hist < 0: bear += 1; reasons.append("MACD confirms")
+        if vol_ratio >= 1.25: bull += 1; bear += 1; reasons.append(f"volume expansion {vol_ratio:.1f}x")
+        if 50 <= last_r < 72: bull += 1; reasons.append(f"RSI {last_r:.0f}")
+        elif 28 < last_r <= 50: bear += 1; reasons.append(f"RSI {last_r:.0f}")
+    elif strategy == "pullback":
+        total = 6.0
+        up = last_e21 > last_e50
+        dn = last_e21 < last_e50
+        near_ema = abs(price-last_e21)/price <= 0.008 or abs(price-last_e9)/price <= 0.005
+        if up: bull += 2; reasons.append("higher-timeframe trend up")
+        elif dn: bear += 2; reasons.append("higher-timeframe trend down")
+        if near_ema:
+            if up: bull += 1; reasons.append("EMA pullback zone")
+            elif dn: bear += 1; reasons.append("EMA pullback zone")
+        if last_hist > 0: bull += 1; reasons.append("momentum resumes +")
+        elif last_hist < 0: bear += 1; reasons.append("momentum resumes -")
+        if 45 <= last_r <= 62: bull += 1; reasons.append(f"RSI {last_r:.0f}")
+        elif 38 <= last_r < 55 and dn: bear += 1; reasons.append(f"RSI {last_r:.0f}")
+        if price > vwap: bull += 1
+        elif price < vwap: bear += 1
+    else:  # confluence
+        total = 5.0
+        if last_e9 > last_e21 > last_e50: bull += 1.5; reasons.append("EMA uptrend")
+        elif last_e9 < last_e21 < last_e50: bear += 1.5; reasons.append("EMA downtrend")
+        if last_hist > 0: bull += 1; reasons.append("MACD bullish")
+        elif last_hist < 0: bear += 1; reasons.append("MACD bearish")
+        if 50 < last_r < 68: bull += 1; reasons.append(f"RSI {last_r:.0f} bullish")
+        elif 32 < last_r < 50: bear += 1; reasons.append(f"RSI {last_r:.0f} bearish")
+        if price > vwap: bull += .75; reasons.append("above VWAP")
+        else: bear += .75; reasons.append("below VWAP")
+        if vol_ratio >= 1.10: bull += .75 if price > last_e9 else 0; bear += .75 if price < last_e9 else 0; reasons.append(f"volume {vol_ratio:.1f}x")
 
     max_score = max(bull, bear)
-    confidence = min(95, int((max_score / total) * 100))
+    confidence = min(95, int(round((max_score / total) * 100)))
     action = "BUY" if bull > bear else "SELL" if bear > bull else "WAIT"
-    if confidence < 50:
+    # Deliberately selective: low-score setups stay WAIT.
+    if confidence < 55:
         action = "WAIT"
     return {
         "action": action, "confidence": confidence, "price": float(price),
         "reason": ", ".join(reasons) if reasons else "No clear setup",
-        "rsi": round(float(last_r), 1),
+        "rsi": round(float(last_r), 1), "strategy": strategy,
+        "volume_ratio": round(float(vol_ratio), 2), "vwap": round(float(vwap), 8),
     }
 
 
@@ -582,6 +684,11 @@ def scan(current_user):
     try:
         requested_interval = (request.args.get("interval") or "15m").lower()
         requested_confirm = (request.args.get("confirm_interval") or "1h").lower()
+        strategy = (request.args.get("strategy") or "confluence").lower()
+        trade_mode = (request.args.get("trade_mode") or "scalp").lower()
+        allowed_strategies = {"confluence", "trend_momentum", "breakout", "pullback"}
+        if strategy not in allowed_strategies:
+            strategy = "confluence"
         interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
         interval = interval_map.get(requested_interval, "15m")
         confirm_interval = interval_map.get(requested_confirm, "1h")
@@ -611,8 +718,8 @@ def scan(current_user):
         for pair in WATCHLIST:
             df, err = candle_results.get((pair, "primary"), (None, "Primary candle request missing"))
             cdf, cerr = candle_results.get((pair, "confirm"), (None, "Confirmation candle request missing"))
-            primary = compute_signal(df)
-            confirm = compute_signal(cdf)
+            primary = compute_signal(df, strategy)
+            confirm = compute_signal(cdf, strategy)
             sig = dict(primary)
 
             p_action = primary.get("action", "WAIT")
@@ -632,6 +739,8 @@ def scan(current_user):
             if live_price is not None:
                 sig["price"] = live_price
             sig["pair"] = pair
+            sig["strategy"] = strategy
+            sig["trade_mode"] = trade_mode
             sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
             sig["currency"] = "USDT"
             candle_sources = {
@@ -667,6 +776,22 @@ def scan(current_user):
             if errors:
                 sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
             results.append(sig)
+            try:
+                db.session.add(SignalLog(
+                    user_id=current_user.id, pair=sig.get("display_pair") or pair,
+                    action=sig.get("action"), confidence=float(sig.get("confidence", 0) or 0),
+                    price=float(sig.get("price", 0) or 0), strategy=strategy, trade_mode=trade_mode,
+                    primary_tf=interval, confirm_tf=confirm_interval, confirm_action=c_action,
+                    data_source=sig.get("data_source", ""), reason=(sig.get("reason", "") or "")[:500]
+                ))
+            except Exception:
+                app.logger.exception("Could not queue signal journal row")
+
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("Signal journal commit failed")
 
         return jsonify({
             "signals": results,
@@ -676,6 +801,8 @@ def scan(current_user):
             "confirm_requested_interval": requested_confirm,
             "confirm_actual_interval": confirm_interval,
             "feed_status": "ok" if any("public data" in x.get("data_source", "") for x in results) else "unavailable",
+            "strategy": strategy,
+            "trade_mode": trade_mode,
         }), 200
     except Exception as e:
         app.logger.exception("/api/scan crashed")
@@ -756,6 +883,15 @@ def execute(current_user):
         trade_mode=current_user.mode,
     )
     db.session.add(trade)
+    try:
+        db.session.add(TradeEvent(
+            user_id=current_user.id, event="ENTRY", pair=pair, side=side,
+            price=price, entry=price, leverage=1, confidence=float(confidence or 0),
+            strategy=current_user.strategy or "confluence", trade_mode=current_user.mode,
+            reason=note[:120], source="CoinDCX" if current_user.mode == "live" else "Public Feed"
+        ))
+    except Exception:
+        app.logger.exception("Could not queue execute trade journal")
     db.session.commit()
 
     return jsonify({
@@ -807,6 +943,53 @@ def log_trade(current_user):
     db.session.commit()
     return jsonify({"trade": trade.to_dict(),
                      "portfolio": current_user.portfolio}), 201
+
+
+
+# ─────────────────────────────────────────────
+# SIGNAL / TRADE JOURNALS + CSV EXPORT
+# ─────────────────────────────────────────────
+@app.route("/api/trade-events", methods=["POST"])
+@token_required
+def log_trade_event(current_user):
+    data = request.get_json(force=True) or {}
+    ev = TradeEvent(
+        user_id=current_user.id, event=(data.get("event") or "ENTRY")[:10],
+        pair=data.get("pair"), side=data.get("side"), price=data.get("price"),
+        entry=data.get("entry"), exit_price=data.get("exit"), pnl=data.get("pnl", 0),
+        leverage=data.get("leverage", 1), confidence=data.get("confidence"),
+        strategy=(data.get("strategy") or "confluence")[:40],
+        trade_mode=(data.get("trade_mode") or "scalp")[:20],
+        reason=(data.get("reason") or "")[:120], source=(data.get("source") or "")[:80],
+    )
+    db.session.add(ev); db.session.commit()
+    return jsonify({"ok": True, "id": ev.id}), 201
+
+
+def _csv_response(filename, headers, rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers)
+    for row in rows: w.writerow(row)
+    return Response(buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.route("/api/export/signals.csv", methods=["GET"])
+@token_required
+def export_signals(current_user):
+    q = SignalLog.query.filter_by(user_id=current_user.id).order_by(SignalLog.created_at.asc()).all()
+    return _csv_response("algobot_signal_journal.csv",
+        ["time_utc","mode","strategy","pair","action","confidence","price","primary_tf","confirm_tf","confirm_action","data_source","reason"],
+        [[x.created_at.isoformat(),x.trade_mode,x.strategy,x.pair,x.action,x.confidence,x.price,x.primary_tf,x.confirm_tf,x.confirm_action,x.data_source,x.reason] for x in q])
+
+
+@app.route("/api/export/trades.csv", methods=["GET"])
+@token_required
+def export_trade_events(current_user):
+    q = TradeEvent.query.filter_by(user_id=current_user.id).order_by(TradeEvent.created_at.asc()).all()
+    return _csv_response("algobot_trade_journal.csv",
+        ["time_utc","event","mode","strategy","pair","side","price","entry","exit","pnl","leverage","confidence","source","reason"],
+        [[x.created_at.isoformat(),x.event,x.trade_mode,x.strategy,x.pair,x.side,x.price,x.entry,x.exit_price,x.pnl,x.leverage,x.confidence,x.source,x.reason] for x in q])
 
 
 # ─────────────────────────────────────────────
