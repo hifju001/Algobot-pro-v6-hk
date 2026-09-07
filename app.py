@@ -11,6 +11,7 @@ import hashlib
 import json
 import time
 import datetime
+import threading
 import requests
 import traceback
 import csv
@@ -167,6 +168,69 @@ class TradeEvent(db.Model):
     reason = db.Column(db.String(120))
     source = db.Column(db.String(80))
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class AutoBotConfig(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), unique=True, nullable=False, index=True)
+    enabled = db.Column(db.Boolean, default=False, nullable=False)
+    trade_mode = db.Column(db.String(20), default="scalp")
+    strategy = db.Column(db.String(40), default="confluence")
+    primary_tf = db.Column(db.String(10), default="1m")
+    confirm_tf = db.Column(db.String(10), default="5m")
+    scan_interval_sec = db.Column(db.Integer, default=60)
+    min_confidence = db.Column(db.Float, default=75.0)
+    sl_pct = db.Column(db.Float, default=0.5)
+    tp_pct = db.Column(db.Float, default=1.0)
+    max_positions = db.Column(db.Integer, default=5)
+    daily_loss_limit = db.Column(db.Float, default=3000.0)
+    risk_pct = db.Column(db.Float, default=1.5)
+    last_scan_at = db.Column(db.DateTime)
+    last_success_at = db.Column(db.DateTime)
+    last_error = db.Column(db.String(500), default="")
+    last_source = db.Column(db.String(100), default="")
+    scans_count = db.Column(db.Integer, default=0)
+    entries_count = db.Column(db.Integer, default=0)
+    exits_count = db.Column(db.Integer, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class PaperPosition(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    pair = db.Column(db.String(30), nullable=False, index=True)
+    display_pair = db.Column(db.String(30))
+    side = db.Column(db.String(10), nullable=False)
+    entry = db.Column(db.Float, nullable=False)
+    sl = db.Column(db.Float, nullable=False)
+    tp = db.Column(db.Float, nullable=False)
+    quantity = db.Column(db.Float, nullable=False)
+    notional = db.Column(db.Float, nullable=False)
+    leverage = db.Column(db.Float, default=1.0)
+    confidence = db.Column(db.Float)
+    strategy = db.Column(db.String(40))
+    trade_mode = db.Column(db.String(20))
+    source = db.Column(db.String(80))
+    status = db.Column(db.String(12), default="OPEN", index=True)
+    opened_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
+    closed_at = db.Column(db.DateTime)
+    exit_price = db.Column(db.Float)
+    pnl = db.Column(db.Float, default=0.0)
+    exit_reason = db.Column(db.String(120))
+    last_price = db.Column(db.Float)
+    last_checked_at = db.Column(db.DateTime)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "pair": self.pair, "display_pair": self.display_pair,
+            "side": self.side, "entry": self.entry, "sl": self.sl, "tp": self.tp,
+            "quantity": self.quantity, "notional": self.notional, "leverage": self.leverage,
+            "confidence": self.confidence, "strategy": self.strategy, "trade_mode": self.trade_mode,
+            "source": self.source, "status": self.status, "opened_at": self.opened_at.isoformat() if self.opened_at else None,
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "exit_price": self.exit_price, "pnl": self.pnl, "exit_reason": self.exit_reason,
+            "last_price": self.last_price, "last_checked_at": self.last_checked_at.isoformat() if self.last_checked_at else None,
+        }
 
 
 # ─────────────────────────────────────────────
@@ -677,139 +741,136 @@ def update_keys(current_user):
 WATCHLIST = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-BNB_USDT"]
 
 
-@app.route("/api/scan", methods=["GET"])
-@token_required
-def scan(current_user):
-    """Real CoinDCX scan. Network calls are parallelized to avoid Render gateway timeouts."""
-    try:
-        requested_interval = (request.args.get("interval") or "15m").lower()
-        requested_confirm = (request.args.get("confirm_interval") or "1h").lower()
-        strategy = (request.args.get("strategy") or "confluence").lower()
-        trade_mode = (request.args.get("trade_mode") or "scalp").lower()
-        allowed_strategies = {"confluence", "trend_momentum", "breakout", "pullback"}
-        if strategy not in allowed_strategies:
-            strategy = "confluence"
-        interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
-        interval = interval_map.get(requested_interval, "15m")
-        confirm_interval = interval_map.get(requested_confirm, "1h")
+def perform_market_scan(current_user, requested_interval="15m", requested_confirm="1h", strategy="confluence", trade_mode="scalp", log_signals=True):
+    """Shared real-market scan used by both HTTP requests and the 24x7 backend worker."""
+    requested_interval = (requested_interval or "15m").lower()
+    requested_confirm = (requested_confirm or "1h").lower()
+    strategy = (strategy or "confluence").lower()
+    trade_mode = (trade_mode or "scalp").lower()
+    allowed_strategies = {"confluence", "trend_momentum", "breakout", "pullback"}
+    if strategy not in allowed_strategies:
+        strategy = "confluence"
+    interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
+    interval = interval_map.get(requested_interval, "15m")
+    confirm_interval = interval_map.get(requested_confirm, "1h")
 
-        # Fetch the full ticker only ONCE per scan instead of once per symbol.
-        ticker_map, ticker_global_err = fetch_all_tickers()
-
-        # Fetch primary + confirmation candles concurrently. V4 did 8 candle
-        # requests sequentially, which could exceed Render's request window.
-        # max_workers kept modest (not len(jobs)) because Render's free tier
-        # gives ~512MB RAM per instance; too many concurrent pandas DataFrames
-        # in memory at once was crashing the worker with SIGSEGV (exit 139).
-        candle_results = {}
-        jobs = {}
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            for pair in WATCHLIST:
-                jobs[pool.submit(fetch_candles, pair, interval, 200)] = (pair, "primary")
-                jobs[pool.submit(fetch_candles, pair, confirm_interval, 200)] = (pair, "confirm")
-            for fut in as_completed(jobs):
-                pair, kind = jobs[fut]
-                try:
-                    candle_results[(pair, kind)] = fut.result()
-                except Exception as e:
-                    candle_results[(pair, kind)] = (None, f"{type(e).__name__}: {e}")
-
-        results = []
+    ticker_map, ticker_global_err = fetch_all_tickers()
+    candle_results = {}
+    jobs = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
         for pair in WATCHLIST:
-            df, err = candle_results.get((pair, "primary"), (None, "Primary candle request missing"))
-            cdf, cerr = candle_results.get((pair, "confirm"), (None, "Confirmation candle request missing"))
-            primary = compute_signal(df, strategy)
-            confirm = compute_signal(cdf, strategy)
-            sig = dict(primary)
-
-            p_action = primary.get("action", "WAIT")
-            c_action = confirm.get("action", "WAIT")
-            confirmation_ok = p_action in ("BUY", "SELL") and p_action == c_action
-            if p_action in ("BUY", "SELL") and not confirmation_ok:
-                sig["action"] = "WAIT"
-                sig["confidence"] = min(int(primary.get("confidence", 0)), 49)
-                sig["reason"] = f"Primary {p_action} not confirmed by {confirm_interval} ({c_action}) | " + primary.get("reason", "")
-            elif confirmation_ok:
-                sig["confidence"] = min(95, round((int(primary.get("confidence",0))*0.65) + (int(confirm.get("confidence",0))*0.35)))
-                sig["reason"] = f"MTF confirmed {p_action} ({interval}+{confirm_interval}) | " + primary.get("reason", "")
-
-            live_price, ticker_ts, ticker_err = fetch_live_ticker_price(pair, ticker_map)
-            if ticker_global_err and not ticker_err:
-                ticker_err = ticker_global_err
-            if live_price is not None:
-                sig["price"] = live_price
-            sig["pair"] = pair
-            sig["strategy"] = strategy
-            sig["trade_mode"] = trade_mode
-            sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
-            sig["currency"] = "USDT"
-            candle_sources = {
-                row.get("_source") for rows in (df, cdf) if rows for row in rows[-1:] if row.get("_source")
-            }
-            ticker_source = ticker_map.get("__SOURCE__") if isinstance(ticker_map, dict) else None
-            if ticker_source:
-                candle_sources.add(ticker_source)
-            if df and cdf and live_price is not None and candle_sources:
-                sig["data_source"] = "/".join(sorted(candle_sources)) + " public data"
-            else:
-                sig["data_source"] = "partial/unavailable"
-            sig["requested_interval"] = requested_interval
-            sig["actual_interval"] = interval
-            sig["confirm_requested_interval"] = requested_confirm
-            sig["confirm_actual_interval"] = confirm_interval
-            sig["confirmation_action"] = c_action
-            sig["confirmation_confidence"] = confirm.get("confidence", 0)
-            sig["confirmation_ok"] = confirmation_ok
-            if df:
-                candle_ms = int(df[-1].get("time", 0) or 0)
-                sig["candle_time"] = datetime.datetime.fromtimestamp(candle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if candle_ms else None
-            if cdf:
-                ccandle_ms = int(cdf[-1].get("time", 0) or 0)
-                sig["confirm_candle_time"] = datetime.datetime.fromtimestamp(ccandle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if ccandle_ms else None
-            if ticker_ts is not None:
-                sig["quote_time"] = ticker_ts.isoformat()
-                sig["feed_age_seconds"] = max(0, int((datetime.datetime.now(datetime.timezone.utc) - ticker_ts).total_seconds()))
-            else:
-                sig["quote_time"] = None
-                sig["feed_age_seconds"] = None
-            errors = [x for x in (err, cerr, ticker_err) if x]
-            if errors:
-                sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
-            results.append(sig)
+            jobs[pool.submit(fetch_candles, pair, interval, 200)] = (pair, "primary")
+            jobs[pool.submit(fetch_candles, pair, confirm_interval, 200)] = (pair, "confirm")
+        for fut in as_completed(jobs):
+            pair, kind = jobs[fut]
             try:
-                db.session.add(SignalLog(
-                    user_id=current_user.id, pair=sig.get("display_pair") or pair,
-                    action=sig.get("action"), confidence=float(sig.get("confidence", 0) or 0),
-                    price=float(sig.get("price", 0) or 0), strategy=strategy, trade_mode=trade_mode,
-                    primary_tf=interval, confirm_tf=confirm_interval, confirm_action=c_action,
-                    data_source=sig.get("data_source", ""), reason=(sig.get("reason", "") or "")[:500]
-                ))
-            except Exception:
-                app.logger.exception("Could not queue signal journal row")
+                candle_results[(pair, kind)] = fut.result()
+            except Exception as e:
+                candle_results[(pair, kind)] = (None, f"{type(e).__name__}: {e}")
 
+    results = []
+    for pair in WATCHLIST:
+        df, err = candle_results.get((pair, "primary"), (None, "Primary candle request missing"))
+        cdf, cerr = candle_results.get((pair, "confirm"), (None, "Confirmation candle request missing"))
+        primary = compute_signal(df, strategy)
+        confirm = compute_signal(cdf, strategy)
+        sig = dict(primary)
+
+        p_action = primary.get("action", "WAIT")
+        c_action = confirm.get("action", "WAIT")
+        confirmation_ok = p_action in ("BUY", "SELL") and p_action == c_action
+        if p_action in ("BUY", "SELL") and not confirmation_ok:
+            sig["action"] = "WAIT"
+            sig["confidence"] = min(int(primary.get("confidence", 0)), 49)
+            sig["reason"] = f"Primary {p_action} not confirmed by {confirm_interval} ({c_action}) | " + primary.get("reason", "")
+        elif confirmation_ok:
+            sig["confidence"] = min(95, round((int(primary.get("confidence",0))*0.65) + (int(confirm.get("confidence",0))*0.35)))
+            sig["reason"] = f"MTF confirmed {p_action} ({interval}+{confirm_interval}) | " + primary.get("reason", "")
+
+        live_price, ticker_ts, ticker_err = fetch_live_ticker_price(pair, ticker_map)
+        if ticker_global_err and not ticker_err:
+            ticker_err = ticker_global_err
+        if live_price is not None:
+            sig["price"] = live_price
+        sig["pair"] = pair
+        sig["strategy"] = strategy
+        sig["trade_mode"] = trade_mode
+        sig["display_pair"] = pair.replace("B-", "").replace("_", "/")
+        sig["currency"] = "USDT"
+        candle_sources = {
+            row.get("_source") for rows in (df, cdf) if rows for row in rows[-1:] if row.get("_source")
+        }
+        ticker_source = ticker_map.get("__SOURCE__") if isinstance(ticker_map, dict) else None
+        if ticker_source:
+            candle_sources.add(ticker_source)
+        if df and cdf and live_price is not None and candle_sources:
+            sig["data_source"] = "/".join(sorted(candle_sources)) + " public data"
+        else:
+            sig["data_source"] = "partial/unavailable"
+        sig["requested_interval"] = requested_interval
+        sig["actual_interval"] = interval
+        sig["confirm_requested_interval"] = requested_confirm
+        sig["confirm_actual_interval"] = confirm_interval
+        sig["confirmation_action"] = c_action
+        sig["confirmation_confidence"] = confirm.get("confidence", 0)
+        sig["confirmation_ok"] = confirmation_ok
+        if df:
+            candle_ms = int(df[-1].get("time", 0) or 0)
+            sig["candle_time"] = datetime.datetime.fromtimestamp(candle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if candle_ms else None
+        if cdf:
+            ccandle_ms = int(cdf[-1].get("time", 0) or 0)
+            sig["confirm_candle_time"] = datetime.datetime.fromtimestamp(ccandle_ms/1000.0, tz=datetime.timezone.utc).isoformat() if ccandle_ms else None
+        if ticker_ts is not None:
+            sig["quote_time"] = ticker_ts.isoformat()
+            sig["feed_age_seconds"] = max(0, int((datetime.datetime.now(datetime.timezone.utc) - ticker_ts).total_seconds()))
+        else:
+            sig["quote_time"] = None
+            sig["feed_age_seconds"] = None
+        errors = [x for x in (err, cerr, ticker_err) if x]
+        if errors:
+            sig["reason"] = (sig.get("reason", "") + " | " + " | ".join(errors)).strip(" |")
+        results.append(sig)
+        if log_signals:
+            db.session.add(SignalLog(
+                user_id=current_user.id, pair=sig.get("display_pair") or pair,
+                action=sig.get("action"), confidence=float(sig.get("confidence", 0) or 0),
+                price=float(sig.get("price", 0) or 0), strategy=strategy, trade_mode=trade_mode,
+                primary_tf=interval, confirm_tf=confirm_interval, confirm_action=c_action,
+                data_source=sig.get("data_source", ""), reason=(sig.get("reason", "") or "")[:500]
+            ))
+
+    if log_signals:
         try:
             db.session.commit()
         except Exception:
             db.session.rollback()
             app.logger.exception("Signal journal commit failed")
 
-        return jsonify({
-            "signals": results,
-            "mode": current_user.mode,
-            "requested_interval": requested_interval,
-            "actual_interval": interval,
-            "confirm_requested_interval": requested_confirm,
-            "confirm_actual_interval": confirm_interval,
-            "feed_status": "ok" if any("public data" in x.get("data_source", "") for x in results) else "unavailable",
-            "strategy": strategy,
-            "trade_mode": trade_mode,
-        }), 200
+    return {
+        "signals": results, "mode": current_user.mode,
+        "requested_interval": requested_interval, "actual_interval": interval,
+        "confirm_requested_interval": requested_confirm, "confirm_actual_interval": confirm_interval,
+        "feed_status": "ok" if any("public data" in x.get("data_source", "") for x in results) else "unavailable",
+        "strategy": strategy, "trade_mode": trade_mode,
+    }
+
+
+@app.route("/api/scan", methods=["GET"])
+@token_required
+def scan(current_user):
+    try:
+        payload = perform_market_scan(
+            current_user,
+            request.args.get("interval") or "15m",
+            request.args.get("confirm_interval") or "1h",
+            request.args.get("strategy") or "confluence",
+            request.args.get("trade_mode") or "scalp",
+            log_signals=True,
+        )
+        return jsonify(payload), 200
     except Exception as e:
         app.logger.exception("/api/scan crashed")
-        return jsonify({
-            "error": f"SCAN_ENGINE_ERROR: {type(e).__name__}: {e}",
-            "hint": "Check Render logs for the full traceback."
-        }), 500
+        return jsonify({"error": f"SCAN_ENGINE_ERROR: {type(e).__name__}: {e}", "hint": "Check Render logs for the full traceback."}), 500
 
 
 @app.route("/api/feed-test", methods=["GET"])
@@ -993,11 +1054,331 @@ def export_trade_events(current_user):
 
 
 # ─────────────────────────────────────────────
+# 24x7 BACKEND AUTO-PAPER WORKER
+# Runs independently of the browser. State and open positions are persisted
+# in the database, so a Render process restart can resume the paper test.
+# This worker NEVER places live-money orders.
+# ─────────────────────────────────────────────
+MODE_RULES = {
+    "scalp":    {"primary":"1m",  "confirm":"5m",  "sl":0.5, "tp":1.0, "max":5},
+    "intraday": {"primary":"15m", "confirm":"1h",  "sl":0.8, "tp":1.8, "max":3},
+    "options":  {"primary":"5m",  "confirm":"15m", "sl":1.0, "tp":2.0, "max":3},
+    "swing":    {"primary":"4h",  "confirm":"1d",  "sl":4.0, "tp":12.0,"max":3},
+}
+AUTO_ENTRY_MIN_CONFIDENCE = 75.0
+_worker_stop = threading.Event()
+_worker_started = False
+_worker_lock = threading.Lock()
+
+
+def _utcnow():
+    return datetime.datetime.utcnow()
+
+
+def _daily_realized_loss(user_id):
+    today = _utcnow().date()
+    start = datetime.datetime.combine(today, datetime.time.min)
+    rows = PaperPosition.query.filter(
+        PaperPosition.user_id == user_id,
+        PaperPosition.status == "CLOSED",
+        PaperPosition.closed_at >= start,
+        PaperPosition.pnl < 0,
+    ).all()
+    return sum(abs(float(x.pnl or 0)) for x in rows)
+
+
+def _close_position(pos, price, reason, user):
+    price = float(price)
+    if pos.side == "BUY":
+        pnl = (price - pos.entry) * pos.quantity
+    else:
+        pnl = (pos.entry - price) * pos.quantity
+    pos.status = "CLOSED"
+    pos.exit_price = price
+    pos.pnl = pnl
+    pos.exit_reason = reason
+    pos.closed_at = _utcnow()
+    pos.last_price = price
+    pos.last_checked_at = _utcnow()
+    user.portfolio = float(user.portfolio or user.capital or 0) + pnl
+    db.session.add(TradeEvent(
+        user_id=user.id, event="EXIT", pair=pos.pair, side=pos.side,
+        price=price, entry=pos.entry, exit_price=price, pnl=pnl,
+        leverage=pos.leverage or 1, confidence=pos.confidence,
+        strategy=pos.strategy or "confluence", trade_mode=pos.trade_mode or "scalp",
+        reason=reason[:120], source=(pos.source or "Public Feed")[:80],
+    ))
+    db.session.add(Trade(
+        user_id=user.id, pair=pos.pair, side=pos.side, entry=pos.entry,
+        exit_price=price, leverage=int(pos.leverage or 1), pnl=pnl,
+        reason=reason[:50], trade_mode=pos.trade_mode or "scalp",
+    ))
+    return pnl
+
+
+def _monitor_open_positions_fast(cfg, user, now):
+    """Check persisted PAPER positions against a fresh public ticker snapshot.
+
+    This is deliberately independent of the slower strategy scan interval so a
+    TP/SL touch is not missed between 1-minute signal scans. Returns exits count.
+    """
+    positions = PaperPosition.query.filter_by(user_id=user.id, status="OPEN").all()
+    if not positions:
+        return 0
+    ticker_map, ticker_err = fetch_all_tickers()
+    if not ticker_map:
+        if ticker_err:
+            cfg.last_error = ("Exit watchdog: " + ticker_err)[:500]
+        return 0
+    exits = 0
+    for pos in positions:
+        px, _, _ = fetch_live_ticker_price(pos.pair, ticker_map=ticker_map)
+        if not px:
+            continue
+        px = float(px)
+        pos.last_price = px
+        pos.last_checked_at = now
+        reason = None
+        if pos.side == "BUY":
+            if px <= float(pos.sl): reason = "Stop Loss"
+            elif px >= float(pos.tp): reason = "Take Profit"
+        else:
+            if px >= float(pos.sl): reason = "Stop Loss"
+            elif px <= float(pos.tp): reason = "Take Profit"
+        if reason:
+            _close_position(pos, px, reason, user)
+            exits += 1
+    if exits:
+        cfg.exits_count = int(cfg.exits_count or 0) + exits
+    db.session.flush()
+    return exits
+
+
+def _process_auto_config(cfg):
+    user = db.session.get(User, cfg.user_id)
+    if not user or not cfg.enabled:
+        return
+    # Hard safety boundary: the 24x7 worker is paper-only.
+    if user.mode != "paper":
+        cfg.enabled = False
+        cfg.last_error = "Auto worker stopped because account mode is not PAPER"
+        db.session.commit()
+        return
+
+    now = _utcnow()
+
+    # TP/SL watchdog runs on every ~5s worker heartbeat, independently of the
+    # slower signal scan cadence. This prevents a target touch being missed.
+    try:
+        _monitor_open_positions_fast(cfg, user, now)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        cfg = db.session.get(AutoBotConfig, cfg.id)
+        if cfg:
+            cfg.last_error = f"Exit watchdog {type(e).__name__}: {e}"[:500]
+            try: db.session.commit()
+            except Exception: db.session.rollback()
+        app.logger.exception("24x7 TP/SL watchdog failed for user %s", user.id)
+
+    # Full indicator/signal scan respects the configured interval.
+    if cfg.last_scan_at and (now - cfg.last_scan_at).total_seconds() < max(30, int(cfg.scan_interval_sec or 60)):
+        return
+    cfg.last_scan_at = now
+    cfg.scans_count = int(cfg.scans_count or 0) + 1
+
+    try:
+        payload = perform_market_scan(
+            user, cfg.primary_tf, cfg.confirm_tf, cfg.strategy, cfg.trade_mode, log_signals=True
+        )
+        signals = payload.get("signals", [])
+        cfg.last_source = ", ".join(sorted({s.get("data_source", "") for s in signals if "public data" in s.get("data_source", "")}))[:100]
+        price_map = {s.get("pair"): float(s.get("price", 0) or 0) for s in signals if float(s.get("price", 0) or 0) > 0}
+
+        # Existing positions are monitored by the independent ~5s TP/SL watchdog above.
+
+
+        # Enforce daily-loss and max-position controls before new entries.
+        if _daily_realized_loss(user.id) >= float(cfg.daily_loss_limit or 3000):
+            cfg.last_error = "Daily loss limit reached; entries blocked"
+            cfg.last_success_at = now
+            db.session.commit()
+            return
+
+        active = PaperPosition.query.filter_by(user_id=user.id, status="OPEN").count()
+        max_pos = max(1, int(cfg.max_positions or 1))
+        for sig in signals:
+            if active >= max_pos:
+                break
+            action = sig.get("action")
+            conf = float(sig.get("confidence", 0) or 0)
+            source = sig.get("data_source", "")
+            price = float(sig.get("price", 0) or 0)
+            if action not in ("BUY", "SELL"):
+                continue
+            if conf < max(AUTO_ENTRY_MIN_CONFIDENCE, float(cfg.min_confidence or 75)):
+                continue
+            if not sig.get("confirmation_ok") or "public data" not in source or price <= 0:
+                continue
+            if PaperPosition.query.filter_by(user_id=user.id, pair=sig.get("pair"), status="OPEN").first():
+                continue
+            # Cooldown: do not re-enter same symbol/mode inside two scan intervals.
+            recent = PaperPosition.query.filter_by(user_id=user.id, pair=sig.get("pair"), trade_mode=cfg.trade_mode).order_by(PaperPosition.opened_at.desc()).first()
+            if recent and recent.opened_at and (now - recent.opened_at).total_seconds() < max(120, int(cfg.scan_interval_sec or 60) * 2):
+                continue
+
+            sl_pct = float(cfg.sl_pct or 0.5) / 100.0
+            tp_pct = float(cfg.tp_pct or 1.0) / 100.0
+            sl = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
+            tp = price * (1 + tp_pct) if action == "BUY" else price * (1 - tp_pct)
+            # Conservative paper sizing: risk_pct is the capital allocated, not leveraged account risk.
+            notional = max(0.0, float(user.portfolio or user.capital or 0) * float(cfg.risk_pct or 1.5) / 100.0)
+            if notional <= 0:
+                continue
+            qty = notional / price
+            pos = PaperPosition(
+                user_id=user.id, pair=sig.get("pair"), display_pair=sig.get("display_pair"),
+                side=action, entry=price, sl=sl, tp=tp, quantity=qty, notional=notional,
+                leverage=1, confidence=conf, strategy=cfg.strategy, trade_mode=cfg.trade_mode,
+                source=source[:80], status="OPEN", last_price=price, last_checked_at=now,
+            )
+            db.session.add(pos)
+            db.session.add(TradeEvent(
+                user_id=user.id, event="ENTRY", pair=sig.get("pair"), side=action,
+                price=price, entry=price, pnl=0, leverage=1, confidence=conf,
+                strategy=cfg.strategy, trade_mode=cfg.trade_mode,
+                reason=f"24x7 AUTO PAPER >= {cfg.min_confidence:.0f}%"[:120], source=source[:80],
+            ))
+            cfg.entries_count = int(cfg.entries_count or 0) + 1
+            active += 1
+
+        cfg.last_success_at = now
+        cfg.last_error = ""
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        cfg = db.session.get(AutoBotConfig, cfg.id)
+        if cfg:
+            cfg.last_error = f"{type(e).__name__}: {e}"[:500]
+            cfg.last_scan_at = now
+            try: db.session.commit()
+            except Exception: db.session.rollback()
+        app.logger.exception("24x7 auto-paper worker scan failed for user %s", user.id if user else "?")
+
+
+def _autobot_worker_loop():
+    # Short heartbeat; each config independently respects its scan interval.
+    while not _worker_stop.wait(5):
+        try:
+            with app.app_context():
+                enabled_ids = [x.id for x in AutoBotConfig.query.filter_by(enabled=True).all()]
+                for cfg_id in enabled_ids:
+                    cfg = db.session.get(AutoBotConfig, cfg_id)
+                    if cfg and cfg.enabled:
+                        _process_auto_config(cfg)
+                    db.session.remove()
+        except Exception:
+            app.logger.exception("24x7 worker loop error")
+            try:
+                with app.app_context(): db.session.remove()
+            except Exception:
+                pass
+
+
+def start_autobot_worker_once():
+    global _worker_started
+    if os.getenv("DISABLE_AUTOBOT_WORKER", "0") == "1":
+        return
+    with _worker_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(target=_autobot_worker_loop, name="algobot-auto-paper", daemon=True)
+        t.start()
+        _worker_started = True
+        app.logger.info("24x7 auto-paper backend worker started")
+
+
+@app.route("/api/autobot", methods=["GET"])
+@token_required
+def autobot_status(current_user):
+    cfg = AutoBotConfig.query.filter_by(user_id=current_user.id).first()
+    positions = PaperPosition.query.filter_by(user_id=current_user.id, status="OPEN").order_by(PaperPosition.opened_at.asc()).all()
+    if not cfg:
+        return jsonify({"enabled": False, "worker_started": _worker_started, "positions": [], "message": "Not configured"}), 200
+    return jsonify({
+        "enabled": bool(cfg.enabled), "worker_started": _worker_started,
+        "trade_mode": cfg.trade_mode, "strategy": cfg.strategy,
+        "primary_tf": cfg.primary_tf, "confirm_tf": cfg.confirm_tf,
+        "scan_interval_sec": cfg.scan_interval_sec, "min_confidence": cfg.min_confidence,
+        "last_scan_at": cfg.last_scan_at.isoformat() if cfg.last_scan_at else None,
+        "last_success_at": cfg.last_success_at.isoformat() if cfg.last_success_at else None,
+        "last_error": cfg.last_error or "", "last_source": cfg.last_source or "",
+        "scans_count": cfg.scans_count or 0, "entries_count": cfg.entries_count or 0, "exits_count": cfg.exits_count or 0,
+        "positions": [p.to_dict() for p in positions],
+        "portfolio": current_user.portfolio,
+        "account_mode": current_user.mode,
+    }), 200
+
+
+@app.route("/api/autobot", methods=["POST"])
+@token_required
+def autobot_update(current_user):
+    data = request.get_json(force=True) or {}
+    enabled = bool(data.get("enabled", False))
+    if enabled and current_user.mode != "paper":
+        return jsonify({"error": "24x7 Auto Paper can only run while account mode is PAPER"}), 400
+    mode = (data.get("trade_mode") or "scalp").lower()
+    if mode == "india":
+        return jsonify({"error": "India 24x7 paper worker is disabled until a reliable Indian live-data feed is connected"}), 400
+    rules = MODE_RULES.get(mode, MODE_RULES["scalp"])
+    strategy = (data.get("strategy") or current_user.strategy or "confluence").lower()
+    if strategy not in {"confluence","trend_momentum","breakout","pullback"}:
+        strategy = "confluence"
+    cfg = AutoBotConfig.query.filter_by(user_id=current_user.id).first()
+    if not cfg:
+        cfg = AutoBotConfig(user_id=current_user.id)
+        db.session.add(cfg)
+    cfg.enabled = enabled
+    cfg.trade_mode = mode
+    cfg.strategy = strategy
+    cfg.primary_tf = (data.get("primary_tf") or rules["primary"]).lower()
+    cfg.confirm_tf = (data.get("confirm_tf") or rules["confirm"]).lower()
+    cfg.scan_interval_sec = max(30, min(3600, int(data.get("scan_interval_sec") or 60)))
+    cfg.min_confidence = max(AUTO_ENTRY_MIN_CONFIDENCE, float(data.get("min_confidence") or AUTO_ENTRY_MIN_CONFIDENCE))
+    cfg.sl_pct = max(0.05, float(data.get("sl_pct") or rules["sl"]))
+    cfg.tp_pct = max(0.05, float(data.get("tp_pct") or rules["tp"]))
+    cfg.max_positions = max(1, min(20, int(data.get("max_positions") or rules["max"])))
+    cfg.daily_loss_limit = max(0.0, float(data.get("daily_loss_limit") or 3000))
+    cfg.risk_pct = max(0.1, min(10.0, float(data.get("risk_pct") or 1.5)))
+    cfg.last_error = ""
+    current_user.strategy = strategy
+    db.session.commit()
+    if enabled:
+        start_autobot_worker_once()
+    return jsonify({"ok": True, "enabled": cfg.enabled, "message": "24x7 backend Auto Paper started" if enabled else "24x7 backend Auto Paper stopped"}), 200
+
+
+@app.route("/api/autobot/positions", methods=["GET"])
+@token_required
+def autobot_positions(current_user):
+    rows = PaperPosition.query.filter_by(user_id=current_user.id).order_by(PaperPosition.opened_at.desc()).limit(100).all()
+    return jsonify({"positions": [p.to_dict() for p in rows]}), 200
+
+
+# ─────────────────────────────────────────────
 # HEALTH CHECK (Render uses this to confirm the service is alive)
 # ─────────────────────────────────────────────
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "time": datetime.datetime.utcnow().isoformat()})
+    enabled = 0
+    try:
+        enabled = AutoBotConfig.query.filter_by(enabled=True).count()
+    except Exception:
+        pass
+    return jsonify({
+        "status": "ok", "time": datetime.datetime.utcnow().isoformat(),
+        "autobot_worker_started": _worker_started, "autobot_enabled_users": enabled
+    })
 
 
 @app.route("/api/debug-candles", methods=["GET"])
@@ -1035,6 +1416,7 @@ def serve_static(path):
 with app.app_context():
     db.create_all()
 
+start_autobot_worker_once()
 
 
 @app.errorhandler(Exception)

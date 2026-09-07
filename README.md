@@ -3,7 +3,7 @@
 This build extends the stable V8/V7 live-paper core.
 
 ## New in V9
-- Auto Paper entries are hard-gated at **80% confidence or higher**. The Signal Display filter cannot lower the auto-entry threshold.
+- Auto Paper entries are hard-gated at **75% confidence or higher**. The Signal Display filter cannot lower the auto-entry threshold.
 - Every live scan result (BUY / SELL / WAIT / blocked reason) is stored in a persistent **Signal Journal** table.
 - Every paper trade ENTRY and EXIT is stored in a **Trade Journal** table.
 - Signals screen has one-click CSV downloads for both journals.

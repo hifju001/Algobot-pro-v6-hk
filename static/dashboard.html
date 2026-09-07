@@ -474,7 +474,8 @@ canvas{width:100%!important;}
     <div><button class="btn btn-gh" onclick="downloadJournal('signals')">⬇ Signal Journal</button></div>
     <div><button class="btn btn-gh" onclick="downloadJournal('trades')">⬇ Trade Journal</button></div>
   </div>
-  <div class="alert a-w mb8">🤖 Auto Paper entry is fixed at <b>80% confidence or higher</b>. Signal Display only controls what you see; it cannot lower the auto-entry threshold.</div>
+  <div class="alert a-w mb8">🤖 Auto Paper entry is fixed at <b>75% confidence or higher</b>. Signal Display only controls what you see; it cannot lower the auto-entry threshold.</div>
+  <div class="alert a-tl mb8" id="backendBotStatus">24×7 Backend Worker: checking…</div>
   <div class="alert a-p mb12" id="sigModeAlert">⚡ Scalping Signals — Technical + Sentiment + Liquidity filters</div>
   <div id="sigGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;"></div>
   <div class="stit mt12">Engine Log</div>
@@ -705,7 +706,7 @@ const LIVE_STRATEGIES={
   breakout:{name:'Volume Breakout',desc:'20-bar breakout + volume expansion + trend + momentum'},
   pullback:{name:'Trend Pullback',desc:'EMA trend + controlled pullback + momentum resumption + VWAP'},
 };
-const AUTO_ENTRY_CONFIDENCE=80;
+const AUTO_ENTRY_CONFIDENCE=75;
 
 const STRATS=[
   {id:0,name:'Smart Trend+Liq',wr:.66,lb:1},
@@ -778,7 +779,7 @@ const MACRO=[
 let S={
   capital:100000,portfolio:100000,
   trades:[],positions:[],optTrades:[],equityCurve:[100000],
-  botOn:false,botTimer:null,
+  botOn:false,botTimer:null,backendAuto:false,statusTimer:null,
   autoCooldown:{},
   mode:'scalp',stratId:4,liveStrategy:'confluence',
   levOn:false,levMode:'ai',
@@ -1243,6 +1244,9 @@ function monitorRealPaperPositions(sigs){
 }
 
 function autoPaperFromSignals(sigs){
+  // V10: when the 24×7 backend worker is enabled, browser-side execution is disabled
+  // to prevent duplicate entries. The browser becomes monitor/control only.
+  if(S.backendAuto) return;
   if(!S.botOn || !autoPaperIsOn()) return;
   if(!accountIsPaper()){
     log('⚠️ Auto Paper is disabled while account mode is LIVE. Signals continue, but no automatic real orders are sent.','warn');
@@ -1266,6 +1270,7 @@ function onLiveStrategyChange(){
   const sa=document.getElementById('sigModeAlert');
   if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}%`;
   log(`Strategy selected: ${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}`,'ok');
+  if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 config sync failed: '+e.message,'err'));
   scanNow();
 }
 
@@ -1326,21 +1331,72 @@ async function scanNow(){
   const act=sigs.filter(s=>s.action!=='WAIT').length;
   log(`[${S.mode.toUpperCase()}] ${LIVE_STRATEGIES[strategy]?.name||strategy} scan: ${act} actionable | Primary:${res.actual_interval||tf} | Confirm:${res.confirm_actual_interval||ctf} | Auto≥${AUTO_ENTRY_CONFIDENCE}%`,'ok');
 }
-function toggleBot(){
-  S.botOn=!S.botOn;
-  const btn=document.getElementById('botBtn'),badge=document.getElementById('tradeBadge');
-  if(S.botOn){
-    btn.textContent='⏹ Stop Bot';btn.className='btn btn-r';
-    badge.innerHTML='<span class="pulse">●</span> RUNNING';badge.className='hbadge live';
-    const iv=parseInt(document.getElementById('scanEvery')?.value||'60')*1000;
-    S.botTimer=setInterval(()=>{scanNow();},iv);
-    scanNow();log(`🤖 Bot started | ${S.mode} | Auto Paper:${autoPaperIsOn()?'ON':'OFF'} | Lev:${S.levOn?S.levMode:'OFF'}`,'ok');
-  }else{
-    btn.textContent='▶ Start Bot';btn.className='btn btn-c';
-    badge.innerHTML='<span class="pulse">●</span> PAPER';badge.className='hbadge paper';
-    clearInterval(S.botTimer);log('⏹ Bot stopped','warn');
+async function refreshBackendBotStatus(silent=false){
+  try{
+    const r=await algoApi('/autobot');
+    if(!r||r.error){ if(!silent)log('24×7 status error: '+(r?.error||'no response'),'err'); return; }
+    S.backendAuto=!!r.enabled; S.botOn=!!r.enabled;
+    const btn=document.getElementById('botBtn'),badge=document.getElementById('tradeBadge');
+    if(btn){btn.textContent=r.enabled?'⏹ Stop 24×7 Bot':'▶ Start 24×7 Bot';btn.className=r.enabled?'btn btn-r':'btn btn-c';}
+    if(badge){badge.innerHTML=r.enabled?'<span class="pulse">●</span> 24×7 PAPER':'<span class="pulse">●</span> PAPER';badge.className='hbadge '+(r.enabled?'live':'paper');}
+    const st=document.getElementById('backendBotStatus');
+    if(st){
+      const last=r.last_success_at?new Date(r.last_success_at+'Z').toLocaleString('en-IN'):'—';
+      const err=r.last_error?` | ⚠ ${r.last_error}`:'';
+      st.innerHTML=`🖥️ <b>24×7 Backend Worker: ${r.enabled?'RUNNING':'STOPPED'}</b> | Worker:${r.worker_started?'READY':'NOT STARTED'} | ${r.trade_mode||S.mode} ${r.primary_tf||'-'}+${r.confirm_tf||'-'} | ${r.strategy||'-'} | Last success:${last} | Scans:${r.scans_count||0} Entries:${r.entries_count||0} Exits:${r.exits_count||0}${err}`;
+      st.className='alert '+(r.enabled&&!r.last_error?'a-g':'a-tl')+' mb8';
+    }
+    if(Array.isArray(r.positions)){
+      S.positions=r.positions.map(p=>({
+        pair:p.display_pair||p.pair,apiPair:p.pair,side:p.side,price:Number(p.entry),sl:Number(p.sl),tp:Number(p.tp),
+        lev:Number(p.leverage||1),eff:Number(p.notional||0),tradeMode:p.trade_mode||'',strategy:p.strategy||'',confidence:Number(p.confidence||0),
+        ex:p.source||'Public Feed',source:'BACKEND_24X7',liqP:0
+      }));
+      if(Number(r.portfolio)>0)S.portfolio=Number(r.portfolio);
+      updDash();
+    }
+  }catch(e){ if(!silent)log('24×7 status failed: '+e.message,'err'); }
+}
+
+async function syncBackendAutoBot(enabled){
+  const M=MODES[S.mode];
+  const tf=document.getElementById('sigTF')?.value||M.primaryTF;
+  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+  const body={
+    enabled:!!enabled, trade_mode:S.mode, strategy,
+    primary_tf:tf, confirm_tf:M.confirmTF,
+    scan_interval_sec:parseInt(document.getElementById('scanEvery')?.value||'60'),
+    min_confidence:AUTO_ENTRY_CONFIDENCE,
+    sl_pct:Number(S.cfg.slPct||M.sl), tp_pct:Number(S.cfg.tpPct||M.tp),
+    max_positions:Number(S.cfg.maxPos||M.maxPos), daily_loss_limit:Number(S.cfg.dailyLimit||3000),
+    risk_pct:Number(S.cfg.riskPct||1.5)
+  };
+  const r=await algoApi('/autobot',{method:'POST',body:JSON.stringify(body)});
+  if(!r||r.error) throw new Error(r?.error||'No response');
+  return r;
+}
+
+async function toggleBot(){
+  try{
+    if(!S.backendAuto){
+      if(!autoPaperIsOn()){
+        alert('Set Auto Paper to ON before starting the 24×7 backend worker.');
+        return;
+      }
+      await syncBackendAutoBot(true);
+      S.backendAuto=true; S.botOn=true;
+      log(`🖥️ 24×7 backend Auto Paper STARTED | ${S.mode} | ${S.liveStrategy} | Auto≥${AUTO_ENTRY_CONFIDENCE}%`,'ok');
+    }else{
+      await syncBackendAutoBot(false);
+      S.backendAuto=false; S.botOn=false;
+      log('⏹ 24×7 backend Auto Paper STOPPED','warn');
+    }
+    await refreshBackendBotStatus(true);
+  }catch(e){
+    log('24×7 bot control failed: '+e.message,'err'); alert('Bot control failed: '+e.message);
   }
 }
+
 
 // ══════════════════════════════════════════
 // TABS & MODE
@@ -1383,6 +1439,7 @@ function switchMode(m){
   const rm=document.getElementById('rMax');if(rm)rm.value=M.maxPos;
   el('dMode',M.label);el('dModeSub',m==='india'?'NSE/BSE':'Crypto');
   const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}% | SL:${M.sl}% | TP:${M.tp}%`;
+  if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 mode sync failed: '+e.message,'err'));
   calcRisk();scanNow();
 }
 
@@ -1669,8 +1726,11 @@ safeInit('sentiment', refreshSentiment);
 safeInit('liquidity', scanLiquidity);
 safeInit('brokers', buildBrokerGrid);
 safeInit('signals', ()=>scanNow());
-log('🚀 AlgoBot Pro v6 V9 journal + strategy core loaded','ok');
-log('📡 Live signals: CoinDCX/Binance public candles | Strategy selectable | Auto Paper requires ≥80%','sent');
+refreshBackendBotStatus(true);
+S.statusTimer=setInterval(()=>refreshBackendBotStatus(true),15000);
+log('🚀 AlgoBot Pro v6 V10 24×7 backend auto-paper core loaded','ok');
+log('🖥️ Backend worker continues scanning even when this browser is closed (host must remain awake)','ok');
+log('📡 Live signals: CoinDCX/Binance public candles | Strategy selectable | Auto Paper requires ≥75%','sent');
 log('🧯 UI modules are fault-isolated so one module cannot freeze mode switching or Signals','ok');
 log('🇮🇳 India synthetic live signals remain disabled until a reliable real feed is connected','ind');
 </script>
