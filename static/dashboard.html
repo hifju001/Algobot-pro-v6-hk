@@ -1642,6 +1642,30 @@ function renderAnalytics(){
 // ══════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════
+async function manualExitBackendPosition(positionId, pair){
+  if(!positionId){ alert('This position does not have a backend position ID.'); return; }
+  if(!confirm(`Manually exit ${pair} PAPER position now at the latest real public market price?`)) return;
+  try{
+    const r=await algoApi(`/autobot/positions/${positionId}/close`,{method:'POST',body:'{}'});
+    if(!r||r.error){
+      alert('Manual exit failed: '+(r?.error||'No response')+(r?.detail?'\n'+r.detail:''));
+      log('❌ Manual exit failed '+pair+': '+(r?.error||'No response'),'err');
+      return;
+    }
+    log(`🖐 MANUAL PAPER EXIT ${pair} @ ${Number(r.exit_price).toFixed(Number(r.exit_price)>=1000?2:4)} | P&L ${Number(r.pnl)>=0?'+':''}₹${Number(r.pnl).toFixed(2)}`,'ok');
+    await refreshBackendBotStatus(true);
+    // Refresh recent closed trades so dashboard P&L/trade count updates immediately.
+    const tr=await algoApi('/trades');
+    if(tr&&Array.isArray(tr.trades)){
+      S.trades=tr.trades.map(t=>({pair:(t.pair||'').replace(/^B-/,'').replace('_','/'),side:t.side,entry:Number(t.entry||0),exit:Number(t.exit||0),lev:Number(t.leverage||1),pnl:Number(t.pnl||0),reason:t.reason||'',tradeMode:t.trade_mode||''}));
+      updDash();
+    }
+  }catch(e){
+    alert('Manual exit failed: '+e.message);
+    log('❌ Manual exit failed '+pair+': '+e.message,'err');
+  }
+}
+
 function updDash(){
   const pnlT=S.portfolio-S.capital;
   el('dPort','₹'+S.portfolio.toLocaleString('en-IN',{maximumFractionDigits:0}));
@@ -1660,7 +1684,7 @@ function updDash(){
     const stCol=state==='ACTIVE'?'var(--gn)':(state==='NOT_CHECKED'?'var(--yl)':'var(--rd)');
     const curr=lp>0?lp.toFixed(lp>=1000?2:4):'—';
     const ageTxt=age==null?'—':`${Math.round(Number(age))}s`;
-    return `<div class="tr" style="flex-wrap:wrap;gap:7px"><span class="tside ${p.side.toLowerCase()}">${p.side}</span><span class="cy">${p.pair}</span><span class="lb ${lcls(p.lev)}">${p.lev}x</span><span style="color:var(--m2);font-size:9px">[${p.tradeMode}]</span><span>Entry:${p.price.toFixed(p.price>=1000?2:4)}</span><span style="color:var(--cy)">Live:${curr}</span><span class="rd">SL:${Number(p.sl).toFixed(p.sl>=1000?2:4)}</span><span class="gn">TP:${Number(p.tp).toFixed(p.tp>=1000?2:4)}</span><span style="color:${stCol};font-size:9px;font-weight:700">Watch:${state} · ${ageTxt}</span><span class="yl">₹${parseInt(p.eff).toLocaleString('en-IN')}</span></div>`;
+    return `<div class="tr" style="flex-wrap:wrap;gap:7px"><span class="tside ${p.side.toLowerCase()}">${p.side}</span><span class="cy">${p.pair}</span><span class="lb ${lcls(p.lev)}">${p.lev}x</span><span style="color:var(--m2);font-size:9px">[${p.tradeMode}]</span><span>Entry:${p.price.toFixed(p.price>=1000?2:4)}</span><span style="color:var(--cy)">Live:${curr}</span><span class="rd">SL:${Number(p.sl).toFixed(p.sl>=1000?2:4)}</span><span class="gn">TP:${Number(p.tp).toFixed(p.tp>=1000?2:4)}</span><span style="color:${stCol};font-size:9px;font-weight:700">Watch:${state} · ${ageTxt}</span><span class="yl">₹${parseInt(p.eff).toLocaleString('en-IN')}</span>${p.backendId?`<button class="btn btn-r" style="padding:5px 9px;font-size:9px" onclick="manualExitBackendPosition(${Number(p.backendId)}, '${String(p.pair).replace(/'/g,"\'")}')">✋ Exit</button>`:''}</div>`;
   }).join(''):'<div style="color:var(--m1);text-align:center;padding:14px;font-size:11px;">No open positions</div>';
   const tl=document.getElementById('tradeLog');
   tl.innerHTML=S.trades.length?[...S.trades].reverse().slice(0,25).map(t=>`<div class="tr"><span class="tside ${t.side.toLowerCase()}">${t.side}</span><span class="cy">${t.pair}</span><span class="lb ${lcls(t.lev)}">${t.lev}x</span><span style="color:var(--m2);font-size:9px">[${t.tradeMode}]</span><span>₹${t.entry.toFixed(2)}→₹${t.exit.toFixed(2)}</span><span class="tpnl ${t.pnl>=0?'pos':'neg'}">${t.pnl>=0?'+':''}₹${t.pnl.toFixed(2)}</span></div>`).join(''):'<div style="color:var(--m1);text-align:center;padding:14px;font-size:11px;">No trades yet</div>';
