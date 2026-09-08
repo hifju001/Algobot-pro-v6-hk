@@ -1518,6 +1518,71 @@ def autobot_check_exits(current_user):
         return jsonify({"error": f"EXIT_CHECK_ERROR: {type(e).__name__}: {e}"}), 500
 
 
+@app.route("/api/autobot/positions/<int:position_id>/close", methods=["POST"])
+@token_required
+def autobot_manual_close_position(current_user, position_id):
+    """Manually close one OPEN paper position at the latest real public market price.
+
+    Safety boundary: PAPER mode only. This endpoint never sends a broker/exchange order.
+    """
+    if current_user.mode != "paper":
+        return jsonify({"error": "Manual close is PAPER-only"}), 400
+
+    pos = PaperPosition.query.filter_by(
+        id=position_id, user_id=current_user.id, status="OPEN"
+    ).first()
+    if not pos:
+        return jsonify({"error": "Open paper position not found"}), 404
+
+    try:
+        ticker_map, ticker_err = fetch_all_tickers()
+        price = None
+        source = None
+        if ticker_map:
+            price, _, px_err = fetch_live_ticker_price(pos.pair, ticker_map=ticker_map)
+            if not px_err:
+                source = ticker_map.get("__SOURCE__") if isinstance(ticker_map, dict) else None
+
+        # A manual exit should still use a real observed market price. If the
+        # live ticker is temporarily unavailable, allow only a very recent
+        # watchdog price rather than inventing/fabricating an execution price.
+        if price is None and pos.last_price is not None and pos.last_checked_at is not None:
+            age = (_utcnow() - pos.last_checked_at).total_seconds()
+            if age <= 30:
+                price = float(pos.last_price)
+                source = pos.source or "recent watchdog price"
+
+        if price is None:
+            return jsonify({
+                "error": "Live price unavailable; manual paper exit was NOT executed",
+                "detail": ticker_err or "No fresh watchdog price"
+            }), 503
+
+        reason = "Manual Exit"
+        pnl = _close_position(pos, float(price), reason, current_user)
+        cfg = AutoBotConfig.query.filter_by(user_id=current_user.id).first()
+        if cfg:
+            cfg.exits_count = int(cfg.exits_count or 0) + 1
+            cfg.last_source = str(source or pos.source or "Public Feed")[:100]
+        db.session.commit()
+        return jsonify({
+            "ok": True,
+            "message": "Paper position closed manually",
+            "position_id": pos.id,
+            "pair": pos.display_pair or pos.pair,
+            "side": pos.side,
+            "exit_price": pos.exit_price,
+            "pnl": pnl,
+            "reason": reason,
+            "source": source or pos.source or "Public Feed",
+            "portfolio": current_user.portfolio,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception("Manual paper close failed for position %s", position_id)
+        return jsonify({"error": f"MANUAL_CLOSE_ERROR: {type(e).__name__}: {e}"}), 500
+
+
 @app.route("/api/autobot/positions", methods=["GET"])
 @token_required
 def autobot_positions(current_user):
