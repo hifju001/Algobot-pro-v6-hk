@@ -1,4 +1,4 @@
-const CACHE_NAME = "algobot-v10-3-cache-20260908";
+const CACHE_NAME = "algobot-v11-mode-strategy-rr";
 const ASSETS = ["/login.html", "/dashboard.html", "/manifest.json"];
 
 self.addEventListener("install", (event) => {

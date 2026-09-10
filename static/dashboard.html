@@ -246,7 +246,7 @@ canvas{width:100%!important;}
     container.innerHTML = '<div style="color:var(--m1);font-size:11px;">Fetching real prices from CoinDCX...</div>';
     const tf = document.getElementById('sigTF')?.value || MODES[S.mode].primaryTF || '5m';
     const ctf = MODES[S.mode].confirmTF || '15m';
-    const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+    const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||MODES[S.mode].defaultStrategy;
     const res = await algoApi('/scan?interval=' + encodeURIComponent(tf) + '&confirm_interval=' + encodeURIComponent(ctf) + '&strategy=' + encodeURIComponent(strategy) + '&trade_mode=' + encodeURIComponent(S.mode));
     if(!res){ return; }
     if(res.error){
@@ -461,8 +461,11 @@ canvas{width:100%!important;}
   <div class="fr mb12" style="align-items:flex-end;">
     <div class="fg" style="max-width:130px;"><label>Timeframe</label>
       <select id="sigTF" onchange="manualTFOverride()"><option>1m</option><option>5m</option><option selected>15m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option></select><div id="tfConfirm" style="font-size:9px;color:var(--m1);margin-top:4px">Confirm: 1h</div></div>
-    <div class="fg" style="max-width:180px;"><label>Live Strategy</label>
-      <select id="liveStrategy" onchange="onLiveStrategyChange()"><option value="confluence" selected>Confluence MTF</option><option value="trend_momentum">Trend + Momentum</option><option value="breakout">Volume Breakout</option><option value="pullback">Trend Pullback</option></select></div>
+    <div class="fg" style="max-width:190px;"><label>Mode Strategy</label>
+      <select id="liveStrategy" onchange="onLiveStrategyChange()"></select><div id="strategyHint" style="font-size:8px;color:var(--m1);margin-top:4px"></div></div>
+    <div class="fg" style="max-width:95px;"><label>SL %</label><input type="number" id="quickSL" value="0.35" min="0.05" step="0.05" onchange="onQuickRiskChange()"/></div>
+    <div class="fg" style="max-width:95px;"><label>Risk:Reward</label><input type="number" id="quickRR" value="1.57" min="0.5" step="0.1" onchange="onQuickRiskChange()"/></div>
+    <div class="fg" style="max-width:100px;"><label>TP %</label><input type="number" id="quickTP" value="0.55" step="0.05" readonly/></div>
     <div class="fg" style="max-width:140px;"><label>Signal Display</label>
       <select id="minConf"><option value="50">50%+</option><option value="65" selected>65%+</option><option value="75">75%+</option><option value="80">80%+</option><option value="85">85%+</option></select></div>
     <div class="fg" style="max-width:160px;"><label>Sentiment Filter</label>
@@ -557,8 +560,9 @@ canvas{width:100%!important;}
     <div class="fr">
       <div class="fg"><label>Capital (₹)</label><input type="number" id="rCap" value="100000" oninput="calcRisk()"/></div>
       <div class="fg"><label>Risk/Trade %</label><input type="number" id="rPct" value="1.5" step="0.1" oninput="calcRisk()"/></div>
-      <div class="fg"><label>Stop Loss %</label><input type="number" id="rSL" value="0.5" step="0.1" oninput="calcRisk()"/></div>
-      <div class="fg"><label>Take Profit %</label><input type="number" id="rTP" value="1.0" step="0.1" oninput="calcRisk()"/></div>
+      <div class="fg"><label>Stop Loss %</label><input type="number" id="rSL" value="0.35" step="0.05" oninput="riskInputsChanged('sl')"/></div>
+      <div class="fg"><label>Risk:Reward (1:X)</label><input type="number" id="rRR" value="1.57" min="0.5" step="0.1" oninput="riskInputsChanged('rr')"/></div>
+      <div class="fg"><label>Take Profit %</label><input type="number" id="rTP" value="0.55" step="0.05" oninput="riskInputsChanged('tp')"/></div>
     </div>
     <div class="fr">
       <div class="fg"><label>Max Positions</label><input type="number" id="rMax" value="5" oninput="calcRisk()"/></div>
@@ -694,17 +698,32 @@ canvas{width:100%!important;}
 // CONFIG
 // ══════════════════════════════════════════
 const MODES={
-  scalp:{label:'⚡ Scalping',sl:.5,tp:1.0,maxPos:5,tf:'1m + 5m confirm',primaryTF:'1m',confirmTF:'5m',cap:10},
-  intraday:{label:'📊 Intraday',sl:.8,tp:1.8,maxPos:3,tf:'15m + 1h confirm',primaryTF:'15m',confirmTF:'1h',cap:7},
-  options:{label:'🎯 Options',sl:30,tp:80,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',cap:1},
-  swing:{label:'🌊 Swing',sl:4,tp:12,maxPos:3,tf:'4h + 1d confirm',primaryTF:'4h',confirmTF:'1d',cap:3},
-  india:{label:'🇮🇳 India',sl:.8,tp:1.8,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',cap:3},
+  scalp:{label:'⚡ Scalping',sl:.35,tp:.55,rr:1.57,maxPos:5,tf:'1m + 5m confirm',primaryTF:'1m',confirmTF:'5m',maxHold:30,defaultStrategy:'scalp_vwap_momentum'},
+  intraday:{label:'📊 Intraday',sl:.8,tp:1.6,rr:2.0,maxPos:3,tf:'15m + 1h confirm',primaryTF:'15m',confirmTF:'1h',maxHold:720,defaultStrategy:'intraday_trend'},
+  options:{label:'🎯 Options',sl:.7,tp:1.4,rr:2.0,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',maxHold:240,defaultStrategy:'options_momentum'},
+  swing:{label:'🌊 Swing',sl:3,tp:6,rr:2.0,maxPos:3,tf:'4h + 1d confirm',primaryTF:'4h',confirmTF:'1d',maxHold:10080,defaultStrategy:'swing_trend'},
+  india:{label:'🇮🇳 India',sl:.8,tp:1.6,rr:2.0,maxPos:3,tf:'5m + 15m confirm',primaryTF:'5m',confirmTF:'15m',maxHold:360,defaultStrategy:'intraday_trend'},
 };
 const LIVE_STRATEGIES={
-  confluence:{name:'Confluence MTF',desc:'EMA + MACD + RSI + VWAP + volume'},
-  trend_momentum:{name:'Trend + Momentum',desc:'EMA structure + MACD + RSI + VWAP + volume'},
-  breakout:{name:'Volume Breakout',desc:'20-bar breakout + volume expansion + trend + momentum'},
-  pullback:{name:'Trend Pullback',desc:'EMA trend + controlled pullback + momentum resumption + VWAP'},
+  scalp_vwap_momentum:{name:'Scalp VWAP Momentum',mode:'scalp',desc:'EMA9/21 + VWAP + accelerating MACD + micro momentum'},
+  scalp_ema_pullback:{name:'Scalp EMA Pullback',mode:'scalp',desc:'Fast EMA9 pullback/bounce in EMA9/21 trend'},
+  scalp_breakout:{name:'Scalp Micro Breakout',mode:'scalp',desc:'10-bar breakout + volume + VWAP + momentum'},
+  intraday_trend:{name:'Intraday Trend MTF',mode:'intraday',desc:'EMA9/21/50 trend + MACD + RSI + VWAP'},
+  intraday_vwap_pullback:{name:'Intraday VWAP Pullback',mode:'intraday',desc:'Trend + VWAP/EMA21 pullback and resumption'},
+  intraday_breakout:{name:'Intraday Breakout',mode:'intraday',desc:'20-bar breakout + volume expansion + trend'},
+  options_momentum:{name:'Options Momentum',mode:'options',desc:'Underlying momentum expansion + volume + VWAP'},
+  options_breakout:{name:'Options Volatility Breakout',mode:'options',desc:'Underlying breakout + volume expansion for options signal'},
+  options_reversal:{name:'Options Reversal',mode:'options',desc:'Underlying RSI extreme + momentum reversal confirmation'},
+  swing_trend:{name:'Swing Trend Follow',mode:'swing',desc:'Broad EMA trend + momentum + RSI'},
+  swing_pullback:{name:'Swing Pullback',mode:'swing',desc:'Major trend + EMA21 pullback resumption'},
+  swing_breakout:{name:'Swing Breakout',mode:'swing',desc:'Multi-bar breakout + trend + volume'},
+};
+const MODE_STRATEGIES={
+  scalp:['scalp_vwap_momentum','scalp_ema_pullback','scalp_breakout'],
+  intraday:['intraday_trend','intraday_vwap_pullback','intraday_breakout'],
+  options:['options_momentum','options_breakout','options_reversal'],
+  swing:['swing_trend','swing_pullback','swing_breakout'],
+  india:['intraday_trend','intraday_vwap_pullback','intraday_breakout']
 };
 const AUTO_ENTRY_CONFIDENCE=75;
 
@@ -781,7 +800,7 @@ let S={
   trades:[],positions:[],optTrades:[],equityCurve:[100000],
   botOn:false,botTimer:null,backendAuto:false,statusTimer:null,
   autoCooldown:{},
-  mode:'scalp',stratId:4,liveStrategy:'confluence',
+  mode:'scalp',stratId:4,liveStrategy:'scalp_vwap_momentum',
   levOn:false,levMode:'ai',
   dailyLoss:0,
   cfg:{slPct:.5,tpPct:1.0,riskPct:1.5,maxPos:5,dailyLimit:3000},
@@ -1194,7 +1213,7 @@ function openRealPaperPosition(s,source='AUTO'){
     pair:s.pair, apiPair:s.apiPair||s.pair, price:Number(s.price), side:s.action,
     sl:Number(s.sl), tp:Number(s.tp), lev, margin, eff, qty,
     ex:s.ex||'Public Feed', tradeMode:s.tradeMode||S.mode,
-    confidence:Number(s.conf||0), strategy:s.strategy||S.liveStrategy||'confluence',
+    confidence:Number(s.conf||0), strategy:s.strategy||S.liveStrategy||MODES[S.mode].defaultStrategy,
     sentScore:S.sent.score, t:ts(), openedAt:Date.now(), source:'REAL_PUBLIC_FEED', autoSource:source
   };
   S.positions.push(pos);
@@ -1264,14 +1283,63 @@ function autoPaperFromSignals(sigs){
   }
 }
 
-function onLiveStrategyChange(){
-  S.liveStrategy=document.getElementById('liveStrategy')?.value||'confluence';
+const modeRiskSettings=(()=>{try{return JSON.parse(localStorage.getItem('algobot_mode_risk_v11')||'{}')}catch(_e){return {}}})();
+function saveModeRisk(){try{localStorage.setItem('algobot_mode_risk_v11',JSON.stringify(modeRiskSettings))}catch(_e){}}
+function currentModeRisk(){
+  const M=MODES[S.mode]; const x=modeRiskSettings[S.mode]||{};
+  const sl=Number(x.sl||M.sl), rr=Number(x.rr||M.rr||((M.tp||1)/(M.sl||1)));
+  return {sl,rr,tp:Number((sl*rr).toFixed(4))};
+}
+function applyModeStrategies(){
+  const sel=document.getElementById('liveStrategy'); if(!sel)return;
+  const allowed=MODE_STRATEGIES[S.mode]||MODE_STRATEGIES.scalp;
+  const previous=(S.liveStrategy&&allowed.includes(S.liveStrategy))?S.liveStrategy:MODES[S.mode].defaultStrategy;
+  sel.innerHTML=allowed.map(k=>`<option value="${k}">${LIVE_STRATEGIES[k].name}</option>`).join('');
+  sel.value=previous; S.liveStrategy=previous;
+  const h=document.getElementById('strategyHint'); if(h)h.textContent=LIVE_STRATEGIES[previous]?.desc||'';
+}
+function applyModeRiskUI(){
+  const r=currentModeRisk(); S.cfg.slPct=r.sl;S.cfg.tpPct=r.tp;
+  const qsl=document.getElementById('quickSL'),qrr=document.getElementById('quickRR'),qtp=document.getElementById('quickTP');
+  if(qsl)qsl.value=r.sl;if(qrr)qrr.value=r.rr;if(qtp)qtp.value=r.tp;
+  const sl=document.getElementById('rSL'),rr=document.getElementById('rRR'),tp=document.getElementById('rTP');
+  if(sl)sl.value=r.sl;if(rr)rr.value=r.rr;if(tp)tp.value=r.tp;
+}
+function onQuickRiskChange(){
   const M=MODES[S.mode];
-  const sa=document.getElementById('sigModeAlert');
-  if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}%`;
-  log(`Strategy selected: ${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}`,'ok');
-  if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 config sync failed: '+e.message,'err'));
-  scanNow();
+  let sl=Math.max(.05,Number(document.getElementById('quickSL')?.value||M.sl));
+  let rr=Math.max(.5,Number(document.getElementById('quickRR')?.value||M.rr||2));
+  let tp=Number((sl*rr).toFixed(4));
+  modeRiskSettings[S.mode]={sl,rr}; saveModeRisk();
+  S.cfg.slPct=sl;S.cfg.tpPct=tp;
+  const qtp=document.getElementById('quickTP');if(qtp)qtp.value=tp;
+  const rsl=document.getElementById('rSL'),rrr=document.getElementById('rRR'),rtp=document.getElementById('rTP');
+  if(rsl)rsl.value=sl;if(rrr)rrr.value=rr;if(rtp)rtp.value=tp;
+  calcRisk(); updateModeAlert();
+  if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 risk sync failed: '+e.message,'err'));
+}
+function riskInputsChanged(source){
+  let sl=Math.max(.05,Number(document.getElementById('rSL')?.value||MODES[S.mode].sl));
+  let rr=Math.max(.5,Number(document.getElementById('rRR')?.value||MODES[S.mode].rr||2));
+  let tp=Math.max(.05,Number(document.getElementById('rTP')?.value||sl*rr));
+  if(source==='tp') rr=tp/sl; else tp=sl*rr;
+  modeRiskSettings[S.mode]={sl,rr:Number(rr.toFixed(3))};saveModeRisk();
+  document.getElementById('rRR').value=Number(rr.toFixed(2));document.getElementById('rTP').value=Number(tp.toFixed(4));
+  const qsl=document.getElementById('quickSL'),qrr=document.getElementById('quickRR'),qtp=document.getElementById('quickTP');
+  if(qsl)qsl.value=sl;if(qrr)qrr.value=Number(rr.toFixed(2));if(qtp)qtp.value=Number(tp.toFixed(4));
+  calcRisk(); if(S.backendAuto) syncBackendAutoBot(true).catch(e=>log('24×7 risk sync failed: '+e.message,'err'));
+}
+function updateModeAlert(){
+  const M=MODES[S.mode],r=currentModeRisk(),sa=document.getElementById('sigModeAlert');
+  if(sa)sa.innerHTML=`${M.label} — <b>${M.primaryTF}</b> + <b>${M.confirmTF}</b> | <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Max hold <b>${M.maxHold>=1440?(M.maxHold/1440)+'d':M.maxHold+'m'}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}% | SL:${r.sl}% TP:${r.tp}% (1:${r.rr.toFixed(2)})`;
+}
+
+function onLiveStrategyChange(){
+  S.liveStrategy=document.getElementById('liveStrategy')?.value||MODES[S.mode].defaultStrategy;
+  const h=document.getElementById('strategyHint');if(h)h.textContent=LIVE_STRATEGIES[S.liveStrategy]?.desc||'';
+  updateModeAlert();
+  log(`Strategy selected for ${S.mode}: ${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}`,'ok');
+  if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 strategy sync failed: '+e.message,'err'));
 }
 
 async function downloadJournal(kind){
@@ -1300,7 +1368,7 @@ async function scanNow(){
   }
   const tf=document.getElementById('sigTF')?.value||MODES[S.mode].primaryTF||'5m';
   const ctf=MODES[S.mode].confirmTF||'15m';
-  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||MODES[S.mode].defaultStrategy;
   S.liveStrategy=strategy;
   const res=await algoApi('/scan?interval='+encodeURIComponent(tf)+'&confirm_interval='+encodeURIComponent(ctf)+'&strategy='+encodeURIComponent(strategy)+'&trade_mode='+encodeURIComponent(S.mode));
   if(!res||res.error){
@@ -1311,10 +1379,11 @@ async function scanNow(){
     return;
   }
   const M=MODES[S.mode];
+  const risk=currentModeRisk();
   const sigs=(res.signals||[]).map(x=>{
     const action=x.action||'WAIT', conf=x.confidence||0, price=Number(x.price||0);
-    const sl=action==='BUY'?price*(1-M.sl/100):price*(1+M.sl/100);
-    const tp=action==='BUY'?price*(1+M.tp/100):price*(1-M.tp/100);
+    const sl=action==='BUY'?price*(1-risk.sl/100):price*(1+risk.sl/100);
+    const tp=action==='BUY'?price*(1+risk.tp/100):price*(1-risk.tp/100);
     const filters=[
       {l:`RSI${x.rsi??'-'}`,c:'neut'},
       {l:`TF ${x.actual_interval||tf}`,c:'liq'},
@@ -1344,7 +1413,7 @@ async function refreshBackendBotStatus(silent=false){
       const last=r.last_success_at?new Date(r.last_success_at+'Z').toLocaleString('en-IN'):'—';
       const err=r.last_error?` | ⚠ ${r.last_error}`:'';
       const wd=r.watchdog_last_check_at?new Date(r.watchdog_last_check_at+'Z').toLocaleTimeString('en-IN'):'—';
-      st.innerHTML=`🖥️ <b>24×7 Backend Worker: ${r.enabled?'RUNNING':'STOPPED'}</b> | Worker:${r.worker_started?'READY':'NOT STARTED'} | ${r.trade_mode||S.mode} ${r.primary_tf||'-'}+${r.confirm_tf||'-'} | ${r.strategy||'-'} | Last success:${last} | Exit watch:${wd} | Scans:${r.scans_count||0} Entries:${r.entries_count||0} Exits:${r.exits_count||0}${err}`;
+      st.innerHTML=`🖥️ <b>24×7 Backend Worker: ${r.enabled?'RUNNING':'STOPPED'}</b> | Worker:${r.worker_started?'READY':'NOT STARTED'} | ${r.trade_mode||S.mode} ${r.primary_tf||'-'}+${r.confirm_tf||'-'} | ${LIVE_STRATEGIES[r.strategy]?.name||r.strategy||'-'} | RR 1:${Number(r.risk_reward||0).toFixed(2)} | Max hold:${r.max_hold_min||'-'}m | Last success:${last} | Exit watch:${wd} | Scans:${r.scans_count||0} Entries:${r.entries_count||0} Exits:${r.exits_count||0}${err}`;
       st.className='alert '+(r.enabled&&!r.last_error?'a-g':'a-tl')+' mb8';
     }
     if(Array.isArray(r.positions)){
@@ -1353,6 +1422,7 @@ async function refreshBackendBotStatus(silent=false){
         lev:Number(p.leverage||1),eff:Number(p.notional||0),tradeMode:p.trade_mode||'',strategy:p.strategy||'',confidence:Number(p.confidence||0),
         ex:p.source||'Public Feed',source:'BACKEND_24X7',liqP:0,
         livePrice:Number(p.last_price||0),lastChecked:p.last_checked_at||null,watchdogAge:p.watchdog_age_sec,
+        heldMinutes:Number(p.held_minutes||0),maxHoldMinutes:Number(p.max_hold_minutes||0),
         exitState:p.exit_state||'NOT_CHECKED',backendId:p.id
       }));
       if(Number(r.portfolio)>0)S.portfolio=Number(r.portfolio);
@@ -1376,7 +1446,7 @@ async function refreshBackendBotStatus(silent=false){
 async function syncBackendAutoBot(enabled){
   const M=MODES[S.mode];
   const tf=document.getElementById('sigTF')?.value||M.primaryTF;
-  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||'confluence';
+  const strategy=document.getElementById('liveStrategy')?.value||S.liveStrategy||MODES[S.mode].defaultStrategy;
   const body={
     enabled:!!enabled, trade_mode:S.mode, strategy,
     primary_tf:tf, confirm_tf:M.confirmTF,
@@ -1448,12 +1518,12 @@ function switchMode(m){
   ['scalp','intraday','options','swing','india'].forEach(k=>{const b=document.getElementById('mb-'+k);if(b)b.className='mb';});
   const cls={scalp:'ms',intraday:'mi',options:'mo',swing:'mw',india:'mn'};
   const ab=document.getElementById('mb-'+m);if(ab)ab.className='mb '+cls[m];
-  S.cfg.slPct=M.sl;S.cfg.tpPct=M.tp;S.cfg.maxPos=M.maxPos;
-  const ri=document.getElementById('rSL');if(ri)ri.value=M.sl;
-  const rt=document.getElementById('rTP');if(rt)rt.value=M.tp;
+  S.cfg.maxPos=M.maxPos;
+  applyModeStrategies();
+  applyModeRiskUI();
   const rm=document.getElementById('rMax');if(rm)rm.value=M.maxPos;
   el('dMode',M.label);el('dModeSub',m==='india'?'NSE/BSE':'Crypto');
-  const sa=document.getElementById('sigModeAlert');if(sa)sa.innerHTML=`${M.label} — Primary <b>${M.primaryTF}</b> + Confirm <b>${M.confirmTF}</b> | Strategy: <b>${LIVE_STRATEGIES[S.liveStrategy]?.name||S.liveStrategy}</b> | Auto ≥${AUTO_ENTRY_CONFIDENCE}% | SL:${M.sl}% | TP:${M.tp}%`;
+  updateModeAlert();
   if(S.backendAuto) syncBackendAutoBot(true).then(()=>refreshBackendBotStatus(true)).catch(e=>log('24×7 mode sync failed: '+e.message,'err'));
   calcRisk();scanNow();
 }
@@ -1684,7 +1754,7 @@ function updDash(){
     const stCol=state==='ACTIVE'?'var(--gn)':(state==='NOT_CHECKED'?'var(--yl)':'var(--rd)');
     const curr=lp>0?lp.toFixed(lp>=1000?2:4):'—';
     const ageTxt=age==null?'—':`${Math.round(Number(age))}s`;
-    return `<div class="tr" style="flex-wrap:wrap;gap:7px"><span class="tside ${p.side.toLowerCase()}">${p.side}</span><span class="cy">${p.pair}</span><span class="lb ${lcls(p.lev)}">${p.lev}x</span><span style="color:var(--m2);font-size:9px">[${p.tradeMode}]</span><span>Entry:${p.price.toFixed(p.price>=1000?2:4)}</span><span style="color:var(--cy)">Live:${curr}</span><span class="rd">SL:${Number(p.sl).toFixed(p.sl>=1000?2:4)}</span><span class="gn">TP:${Number(p.tp).toFixed(p.tp>=1000?2:4)}</span><span style="color:${stCol};font-size:9px;font-weight:700">Watch:${state} · ${ageTxt}</span><span class="yl">₹${parseInt(p.eff).toLocaleString('en-IN')}</span>${p.backendId?`<button class="btn btn-r" style="padding:5px 9px;font-size:9px" onclick="manualExitBackendPosition(${Number(p.backendId)}, '${String(p.pair).replace(/'/g,"\'")}')">✋ Exit</button>`:''}</div>`;
+    return `<div class="tr" style="flex-wrap:wrap;gap:7px"><span class="tside ${p.side.toLowerCase()}">${p.side}</span><span class="cy">${p.pair}</span><span class="lb ${lcls(p.lev)}">${p.lev}x</span><span style="color:var(--m2);font-size:9px">[${p.tradeMode}]</span><span>Entry:${p.price.toFixed(p.price>=1000?2:4)}</span><span style="color:var(--cy)">Live:${curr}</span><span class="rd">SL:${Number(p.sl).toFixed(p.sl>=1000?2:4)}</span><span class="gn">TP:${Number(p.tp).toFixed(p.tp>=1000?2:4)}</span><span style="color:var(--m2);font-size:9px">Held:${p.heldMinutes?Math.round(p.heldMinutes)+'m':'-'} / ${p.maxHoldMinutes?((p.maxHoldMinutes>=1440?(p.maxHoldMinutes/1440)+'d':p.maxHoldMinutes+'m')):'-'}</span><span style="color:${stCol};font-size:9px;font-weight:700">Watch:${state} · ${ageTxt}</span><span class="yl">₹${parseInt(p.eff).toLocaleString('en-IN')}</span>${p.backendId?`<button class="btn btn-r" style="padding:5px 9px;font-size:9px" onclick="manualExitBackendPosition(${Number(p.backendId)}, '${String(p.pair).replace(/'/g,"\'")}')">✋ Exit</button>`:''}</div>`;
   }).join(''):'<div style="color:var(--m1);text-align:center;padding:14px;font-size:11px;">No open positions</div>';
   const tl=document.getElementById('tradeLog');
   tl.innerHTML=S.trades.length?[...S.trades].reverse().slice(0,25).map(t=>`<div class="tr"><span class="tside ${t.side.toLowerCase()}">${t.side}</span><span class="cy">${t.pair}</span><span class="lb ${lcls(t.lev)}">${t.lev}x</span><span style="color:var(--m2);font-size:9px">[${t.tradeMode}]</span><span>₹${t.entry.toFixed(2)}→₹${t.exit.toFixed(2)}</span><span class="tpnl ${t.pnl>=0?'pos':'neg'}">${t.pnl>=0?'+':''}₹${t.pnl.toFixed(2)}</span></div>`).join(''):'<div style="color:var(--m1);text-align:center;padding:14px;font-size:11px;">No trades yet</div>';
@@ -1767,6 +1837,7 @@ window.addEventListener('error', (e)=>{
   try{ log('⚠️ UI error: '+(e.message||'unknown error'),'err'); }catch(_e){}
 });
 safeInit('mode', ()=>switchMode('scalp'));
+applyModeStrategies(); applyModeRiskUI(); updateModeAlert();
 safeInit('risk', calcRisk);
 safeInit('sentiment', refreshSentiment);
 safeInit('liquidity', scanLiquidity);
