@@ -477,8 +477,20 @@ def _vwap_last(rows, period=30):
     return pv / vol if vol > 1e-12 else float(subset[-1]["close"])
 
 
-def compute_signal(rows, strategy="confluence"):
-    """Live-candle signal engine. No random inputs are used here."""
+MODE_STRATEGIES = {
+    "scalp": {"scalp_vwap_momentum", "scalp_ema_pullback", "scalp_breakout"},
+    "intraday": {"intraday_trend", "intraday_vwap_pullback", "intraday_breakout"},
+    "options": {"options_momentum", "options_breakout", "options_reversal"},
+    "swing": {"swing_trend", "swing_pullback", "swing_breakout"},
+}
+ALL_LIVE_STRATEGIES = set().union(*MODE_STRATEGIES.values())
+
+def compute_signal(rows, strategy="scalp_vwap_momentum"):
+    """Mode-specific live-candle signal engine. No random inputs.
+
+    Each strategy is intentionally matched to its trading horizon rather than
+    reusing one generic scoring model for every mode.
+    """
     if rows is None or len(rows) < 55:
         return {"action": "WAIT", "confidence": 0, "reason": "Insufficient real data yet", "strategy": strategy}
 
@@ -486,93 +498,205 @@ def compute_signal(rows, strategy="confluence"):
     high = [float(x["high"]) for x in rows]
     low = [float(x["low"]) for x in rows]
     volume = [float(x.get("volume", 0) or 0) for x in rows]
-    e9 = _ema_values(close, 9)
-    e21 = _ema_values(close, 21)
-    e50 = _ema_values(close, 50)
-    ef = _ema_values(close, 12)
-    es = _ema_values(close, 26)
+    e9 = _ema_values(close, 9); e21 = _ema_values(close, 21); e50 = _ema_values(close, 50)
+    ef = _ema_values(close, 12); es = _ema_values(close, 26)
     macd_line = [a-b for a,b in zip(ef, es)]
     signal_line = _ema_values(macd_line, 9)
     hist = [a-b for a,b in zip(macd_line, signal_line)]
 
-    price = close[-1]
+    price = close[-1]; prev_price = close[-2]
     last_e9, last_e21, last_e50 = e9[-1], e21[-1], e50[-1]
+    prev_e9, prev_e21 = e9[-2], e21[-2]
     last_r = _rsi_last(close, 14)
-    last_hist = hist[-1]
+    last_hist, prev_hist = hist[-1], hist[-2]
     avg_vol = _sma(volume[:-1] if len(volume)>1 else volume, 20)
     vol_ratio = volume[-1] / avg_vol if avg_vol > 1e-12 else 1.0
     vwap = _vwap_last(rows, 30)
-    prev20_high = max(high[-21:-1]) if len(high) >= 21 else max(high[:-1])
-    prev20_low = min(low[-21:-1]) if len(low) >= 21 else min(low[:-1])
+    prev20_high = max(high[-21:-1]); prev20_low = min(low[-21:-1])
+    prev10_high = max(high[-11:-1]); prev10_low = min(low[-11:-1])
+    recent_range = max(high[-10:]) - min(low[-10:])
+    range_pct = recent_range / price * 100 if price else 0
 
     bull = bear = 0.0
-    total = 5.0
-    reasons = []
+    reasons=[]
+    total=6.0
 
-    if strategy == "trend_momentum":
-        total = 6.0
-        if last_e9 > last_e21 > last_e50: bull += 2; reasons.append("EMA trend up")
-        elif last_e9 < last_e21 < last_e50: bear += 2; reasons.append("EMA trend down")
-        if last_hist > 0: bull += 1; reasons.append("MACD +")
-        elif last_hist < 0: bear += 1; reasons.append("MACD -")
-        if 52 <= last_r <= 68: bull += 1; reasons.append(f"RSI {last_r:.0f} bullish")
-        elif 32 <= last_r <= 48: bear += 1; reasons.append(f"RSI {last_r:.0f} bearish")
-        if price > vwap: bull += 1; reasons.append("above VWAP")
-        elif price < vwap: bear += 1; reasons.append("below VWAP")
-        if vol_ratio >= 1.15: bull += .5; bear += .5; reasons.append(f"volume {vol_ratio:.1f}x")
-        if price > last_e9: bull += .5
-        elif price < last_e9: bear += .5
-    elif strategy == "breakout":
-        total = 6.0
-        if price > prev20_high: bull += 2; reasons.append("20-bar breakout")
-        elif price < prev20_low: bear += 2; reasons.append("20-bar breakdown")
-        if last_e21 > last_e50: bull += 1; reasons.append("EMA trend up")
-        elif last_e21 < last_e50: bear += 1; reasons.append("EMA trend down")
-        if last_hist > 0: bull += 1; reasons.append("MACD confirms")
-        elif last_hist < 0: bear += 1; reasons.append("MACD confirms")
-        if vol_ratio >= 1.25: bull += 1; bear += 1; reasons.append(f"volume expansion {vol_ratio:.1f}x")
-        if 50 <= last_r < 72: bull += 1; reasons.append(f"RSI {last_r:.0f}")
-        elif 28 < last_r <= 50: bear += 1; reasons.append(f"RSI {last_r:.0f}")
-    elif strategy == "pullback":
-        total = 6.0
-        up = last_e21 > last_e50
-        dn = last_e21 < last_e50
-        near_ema = abs(price-last_e21)/price <= 0.008 or abs(price-last_e9)/price <= 0.005
-        if up: bull += 2; reasons.append("higher-timeframe trend up")
-        elif dn: bear += 2; reasons.append("higher-timeframe trend down")
-        if near_ema:
-            if up: bull += 1; reasons.append("EMA pullback zone")
-            elif dn: bear += 1; reasons.append("EMA pullback zone")
-        if last_hist > 0: bull += 1; reasons.append("momentum resumes +")
-        elif last_hist < 0: bear += 1; reasons.append("momentum resumes -")
-        if 45 <= last_r <= 62: bull += 1; reasons.append(f"RSI {last_r:.0f}")
-        elif 38 <= last_r < 55 and dn: bear += 1; reasons.append(f"RSI {last_r:.0f}")
-        if price > vwap: bull += 1
-        elif price < vwap: bear += 1
-    else:  # confluence
-        total = 5.0
-        if last_e9 > last_e21 > last_e50: bull += 1.5; reasons.append("EMA uptrend")
-        elif last_e9 < last_e21 < last_e50: bear += 1.5; reasons.append("EMA downtrend")
-        if last_hist > 0: bull += 1; reasons.append("MACD bullish")
-        elif last_hist < 0: bear += 1; reasons.append("MACD bearish")
-        if 50 < last_r < 68: bull += 1; reasons.append(f"RSI {last_r:.0f} bullish")
-        elif 32 < last_r < 50: bear += 1; reasons.append(f"RSI {last_r:.0f} bearish")
-        if price > vwap: bull += .75; reasons.append("above VWAP")
-        else: bear += .75; reasons.append("below VWAP")
-        if vol_ratio >= 1.10: bull += .75 if price > last_e9 else 0; bear += .75 if price < last_e9 else 0; reasons.append(f"volume {vol_ratio:.1f}x")
+    # ── SCALPING: fast confirmation, VWAP/EMA9/EMA21 and immediate momentum ──
+    if strategy == "scalp_vwap_momentum":
+        total=7.0
+        if last_e9 > last_e21: bull+=1.5; reasons.append("EMA9>21")
+        elif last_e9 < last_e21: bear+=1.5; reasons.append("EMA9<21")
+        if price > vwap: bull+=1.5; reasons.append("above VWAP")
+        elif price < vwap: bear+=1.5; reasons.append("below VWAP")
+        if last_hist > 0 and last_hist >= prev_hist: bull+=1.5; reasons.append("MACD accelerating +")
+        elif last_hist < 0 and last_hist <= prev_hist: bear+=1.5; reasons.append("MACD accelerating -")
+        if 52 <= last_r <= 68: bull+=1; reasons.append(f"RSI {last_r:.0f}")
+        elif 32 <= last_r <= 48: bear+=1; reasons.append(f"RSI {last_r:.0f}")
+        if vol_ratio >= 1.15: bull += .75 if price>last_e9 else 0; bear += .75 if price<last_e9 else 0; reasons.append(f"vol {vol_ratio:.1f}x")
+        if price > prev10_high: bull+=.75; reasons.append("micro breakout")
+        elif price < prev10_low: bear+=.75; reasons.append("micro breakdown")
 
-    max_score = max(bull, bear)
-    confidence = min(95, int(round((max_score / total) * 100)))
-    action = "BUY" if bull > bear else "SELL" if bear > bull else "WAIT"
-    # Deliberately selective: low-score setups stay WAIT.
+    elif strategy == "scalp_ema_pullback":
+        total=6.5
+        up=last_e9>last_e21; dn=last_e9<last_e21
+        near9=abs(price-last_e9)/price <= .0025
+        if up: bull+=2; reasons.append("fast trend up")
+        elif dn: bear+=2; reasons.append("fast trend down")
+        if near9 and up and price>=prev_price: bull+=1.5; reasons.append("EMA9 bounce")
+        elif near9 and dn and price<=prev_price: bear+=1.5; reasons.append("EMA9 rejection")
+        if last_hist>0: bull+=1; reasons.append("MACD+")
+        elif last_hist<0: bear+=1; reasons.append("MACD-")
+        if price>vwap: bull+=1
+        elif price<vwap: bear+=1
+        if 45<=last_r<=65 and up: bull+=1
+        elif 35<=last_r<=55 and dn: bear+=1
+
+    elif strategy == "scalp_breakout":
+        total=6.0
+        if price>prev10_high: bull+=2; reasons.append("10-bar breakout")
+        elif price<prev10_low: bear+=2; reasons.append("10-bar breakdown")
+        if vol_ratio>=1.25: bull += 1 if price>prev_price else 0; bear += 1 if price<prev_price else 0; reasons.append(f"vol {vol_ratio:.1f}x")
+        if last_e9>last_e21: bull+=1
+        elif last_e9<last_e21: bear+=1
+        if last_hist>0: bull+=1
+        elif last_hist<0: bear+=1
+        if price>vwap: bull+=1
+        elif price<vwap: bear+=1
+
+    # ── INTRADAY: slower trend structure and stronger confirmation ──
+    elif strategy == "intraday_trend":
+        total=7.0
+        if last_e9>last_e21>last_e50: bull+=2; reasons.append("EMA trend up")
+        elif last_e9<last_e21<last_e50: bear+=2; reasons.append("EMA trend down")
+        if last_hist>0: bull+=1.5; reasons.append("MACD+")
+        elif last_hist<0: bear+=1.5; reasons.append("MACD-")
+        if 52<=last_r<=68: bull+=1; reasons.append(f"RSI {last_r:.0f}")
+        elif 32<=last_r<=48: bear+=1; reasons.append(f"RSI {last_r:.0f}")
+        if price>vwap: bull+=1
+        elif price<vwap: bear+=1
+        if vol_ratio>=1.10: bull += .75 if price>last_e21 else 0; bear += .75 if price<last_e21 else 0
+        if last_e21>last_e50 and price>last_e9: bull+=.75
+        elif last_e21<last_e50 and price<last_e9: bear+=.75
+
+    elif strategy == "intraday_vwap_pullback":
+        total=6.5
+        up=last_e21>last_e50; dn=last_e21<last_e50
+        near=abs(price-vwap)/price<=.005 or abs(price-last_e21)/price<=.006
+        if up: bull+=2; reasons.append("trend up")
+        elif dn: bear+=2; reasons.append("trend down")
+        if near and up and price>prev_price: bull+=1.5; reasons.append("pullback recovery")
+        elif near and dn and price<prev_price: bear+=1.5; reasons.append("pullback rejection")
+        if last_hist>0: bull+=1
+        elif last_hist<0: bear+=1
+        if 42<=last_r<=62 and up: bull+=1
+        elif 38<=last_r<=58 and dn: bear+=1
+        if vol_ratio>=1.05: bull += .5 if up else 0; bear += .5 if dn else 0
+        if price>vwap and up: bull+=.5
+        elif price<vwap and dn: bear+=.5
+
+    elif strategy == "intraday_breakout":
+        total=7.0
+        if price>prev20_high: bull+=2.5; reasons.append("20-bar breakout")
+        elif price<prev20_low: bear+=2.5; reasons.append("20-bar breakdown")
+        if vol_ratio>=1.25: bull += 1 if price>prev_price else 0; bear += 1 if price<prev_price else 0; reasons.append(f"vol {vol_ratio:.1f}x")
+        if last_e21>last_e50: bull+=1
+        elif last_e21<last_e50: bear+=1
+        if last_hist>0: bull+=1
+        elif last_hist<0: bear+=1
+        if 50<=last_r<72: bull+=1
+        elif 28<last_r<=50: bear+=1
+        if price>vwap: bull+=.5
+        elif price<vwap: bear+=.5
+
+    # ── OPTIONS MODE: signal on underlying; favors impulse/volatility setups ──
+    elif strategy == "options_momentum":
+        total=7.0
+        if last_e9>last_e21: bull+=1.5; reasons.append("fast trend up")
+        elif last_e9<last_e21: bear+=1.5; reasons.append("fast trend down")
+        if last_hist>0 and last_hist>prev_hist: bull+=2; reasons.append("momentum expansion +")
+        elif last_hist<0 and last_hist<prev_hist: bear+=2; reasons.append("momentum expansion -")
+        if vol_ratio>=1.25: bull += 1 if price>prev_price else 0; bear += 1 if price<prev_price else 0; reasons.append(f"vol {vol_ratio:.1f}x")
+        if 55<=last_r<=72: bull+=1
+        elif 28<=last_r<=45: bear+=1
+        if price>vwap: bull+=1
+        elif price<vwap: bear+=1
+        if range_pct>=0.4: bull += .5 if price>prev_price else 0; bear += .5 if price<prev_price else 0
+
+    elif strategy == "options_breakout":
+        total=7.0
+        if price>prev20_high: bull+=2.5; reasons.append("breakout")
+        elif price<prev20_low: bear+=2.5; reasons.append("breakdown")
+        if vol_ratio>=1.35: bull += 1.5 if price>prev_price else 0; bear += 1.5 if price<prev_price else 0; reasons.append("volume expansion")
+        if last_hist>0: bull+=1
+        elif last_hist<0: bear+=1
+        if last_e9>last_e21: bull+=1
+        elif last_e9<last_e21: bear+=1
+        if price>vwap: bull+=1
+        elif price<vwap: bear+=1
+
+    elif strategy == "options_reversal":
+        total=6.0
+        # Mean-reversion signal after extended RSI, but only after momentum turns.
+        if last_r<=30 and last_hist>prev_hist and price>prev_price: bull+=2.5; reasons.append("oversold reversal")
+        elif last_r>=70 and last_hist<prev_hist and price<prev_price: bear+=2.5; reasons.append("overbought reversal")
+        if price>last_e9 and prev_price<=prev_e9: bull+=1.5; reasons.append("EMA9 reclaim")
+        elif price<last_e9 and prev_price>=prev_e9: bear+=1.5; reasons.append("EMA9 rejection")
+        if vol_ratio>=1.15: bull += 1 if bull>bear else 0; bear += 1 if bear>bull else 0
+        if price>vwap and bull>bear: bull+=1
+        elif price<vwap and bear>bull: bear+=1
+
+    # ── SWING: broad trend / pullback / breakout structure ──
+    elif strategy == "swing_trend":
+        total=7.0
+        if last_e9>last_e21>last_e50: bull+=2.5; reasons.append("major trend up")
+        elif last_e9<last_e21<last_e50: bear+=2.5; reasons.append("major trend down")
+        if last_hist>0: bull+=1.5
+        elif last_hist<0: bear+=1.5
+        if 50<=last_r<=67: bull+=1
+        elif 33<=last_r<=50: bear+=1
+        if price>last_e21: bull+=1
+        elif price<last_e21: bear+=1
+        if vol_ratio>=1.05: bull += .5 if price>last_e21 else 0; bear += .5 if price<last_e21 else 0
+        if price>vwap: bull+=.5
+        elif price<vwap: bear+=.5
+
+    elif strategy == "swing_pullback":
+        total=6.5
+        up=last_e21>last_e50; dn=last_e21<last_e50
+        near21=abs(price-last_e21)/price<=.015
+        if up: bull+=2.5; reasons.append("major trend up")
+        elif dn: bear+=2.5; reasons.append("major trend down")
+        if near21 and up and last_hist>prev_hist: bull+=1.5; reasons.append("pullback turning up")
+        elif near21 and dn and last_hist<prev_hist: bear+=1.5; reasons.append("pullback turning down")
+        if 40<=last_r<=60 and up: bull+=1
+        elif 40<=last_r<=60 and dn: bear+=1
+        if price>vwap and up: bull+=.75
+        elif price<vwap and dn: bear+=.75
+        if vol_ratio>=1.0: bull += .75 if up else 0; bear += .75 if dn else 0
+
+    elif strategy == "swing_breakout":
+        total=7.0
+        if price>prev20_high: bull+=2.5; reasons.append("multi-bar breakout")
+        elif price<prev20_low: bear+=2.5; reasons.append("multi-bar breakdown")
+        if last_e21>last_e50: bull+=1.5
+        elif last_e21<last_e50: bear+=1.5
+        if last_hist>0: bull+=1
+        elif last_hist<0: bear+=1
+        if vol_ratio>=1.20: bull += 1 if price>prev_price else 0; bear += 1 if price<prev_price else 0
+        if 50<=last_r<75: bull+=1
+        elif 25<last_r<=50: bear+=1
+
+    else:
+        # Safe fallback: no trade instead of silently running a strategy from a
+        # different mode.
+        return {"action":"WAIT", "confidence":0, "price":float(price), "reason":f"Strategy {strategy} is not valid for this mode", "rsi":round(float(last_r),1), "strategy":strategy, "volume_ratio":round(float(vol_ratio),2), "vwap":round(float(vwap),8)}
+
+    max_score=max(bull,bear)
+    confidence=min(95, int(round((max_score/max(total,1e-9))*100)))
+    action="BUY" if bull>bear else "SELL" if bear>bull else "WAIT"
     if confidence < 55:
-        action = "WAIT"
-    return {
-        "action": action, "confidence": confidence, "price": float(price),
-        "reason": ", ".join(reasons) if reasons else "No clear setup",
-        "rsi": round(float(last_r), 1), "strategy": strategy,
-        "volume_ratio": round(float(vol_ratio), 2), "vwap": round(float(vwap), 8),
-    }
+        action="WAIT"
+    return {"action":action,"confidence":confidence,"price":float(price),"reason":", ".join(reasons) if reasons else "No clear setup","rsi":round(float(last_r),1),"strategy":strategy,"volume_ratio":round(float(vol_ratio),2),"vwap":round(float(vwap),8)}
 
 
 # ─────────────────────────────────────────────
@@ -745,11 +869,12 @@ def perform_market_scan(current_user, requested_interval="15m", requested_confir
     """Shared real-market scan used by both HTTP requests and the 24x7 backend worker."""
     requested_interval = (requested_interval or "15m").lower()
     requested_confirm = (requested_confirm or "1h").lower()
-    strategy = (strategy or "confluence").lower()
     trade_mode = (trade_mode or "scalp").lower()
-    allowed_strategies = {"confluence", "trend_momentum", "breakout", "pullback"}
+    rules = MODE_RULES.get(trade_mode, MODE_RULES["scalp"])
+    strategy = (strategy or rules["default_strategy"]).lower()
+    allowed_strategies = MODE_STRATEGIES.get(trade_mode, MODE_STRATEGIES["scalp"])
     if strategy not in allowed_strategies:
-        strategy = "confluence"
+        strategy = rules["default_strategy"]
     interval_map = {"1m":"1m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h", "4h":"4h", "1d":"1d"}
     interval = interval_map.get(requested_interval, "15m")
     confirm_interval = interval_map.get(requested_confirm, "1h")
@@ -1060,10 +1185,12 @@ def export_trade_events(current_user):
 # This worker NEVER places live-money orders.
 # ─────────────────────────────────────────────
 MODE_RULES = {
-    "scalp":    {"primary":"1m",  "confirm":"5m",  "sl":0.5, "tp":1.0, "max":5},
-    "intraday": {"primary":"15m", "confirm":"1h",  "sl":0.8, "tp":1.8, "max":3},
-    "options":  {"primary":"5m",  "confirm":"15m", "sl":1.0, "tp":2.0, "max":3},
-    "swing":    {"primary":"4h",  "confirm":"1d",  "sl":4.0, "tp":12.0,"max":3},
+    # primary/confirm timeframes, default SL/TP, max positions, maximum holding time.
+    # Max-hold is a safety/time-style exit; TP/SL can still close earlier.
+    "scalp":    {"primary":"1m",  "confirm":"5m",  "sl":0.35, "tp":0.55, "max":5, "max_hold_min":30,    "default_strategy":"scalp_vwap_momentum"},
+    "intraday": {"primary":"15m", "confirm":"1h",  "sl":0.80, "tp":1.60, "max":3, "max_hold_min":720,   "default_strategy":"intraday_trend"},
+    "options":  {"primary":"5m",  "confirm":"15m", "sl":0.70, "tp":1.40, "max":3, "max_hold_min":240,   "default_strategy":"options_momentum"},
+    "swing":    {"primary":"4h",  "confirm":"1d",  "sl":3.00, "tp":6.00, "max":3, "max_hold_min":10080, "default_strategy":"swing_trend"},
 }
 AUTO_ENTRY_MIN_CONFIDENCE = 75.0
 _worker_stop = threading.Event()
@@ -1227,6 +1354,13 @@ def _monitor_open_positions_fast(cfg, user, now):
             px = float(px)
             pos.last_price = px
             pos.last_checked_at = now
+            mode_rule = MODE_RULES.get((pos.trade_mode or "scalp").lower(), MODE_RULES["scalp"])
+            max_hold_min = int(mode_rule.get("max_hold_min", 0) or 0)
+            held_min = ((now - pos.opened_at).total_seconds() / 60.0) if pos.opened_at else 0
+            if max_hold_min and held_min >= max_hold_min:
+                _close_position(pos, px, f"Time Exit ({max_hold_min}m max hold)", user)
+                exits += 1
+                continue
             reason = _position_trigger_from_price(pos, px)
             if reason:
                 _close_position(pos, px, reason, user)
@@ -1261,6 +1395,13 @@ def _monitor_open_positions_fast(cfg, user, now):
                     pos.last_checked_at = now
                 except Exception:
                     pass
+                mode_rule = MODE_RULES.get((pos.trade_mode or "scalp").lower(), MODE_RULES["scalp"])
+                max_hold_min = int(mode_rule.get("max_hold_min", 0) or 0)
+                held_min = ((now - pos.opened_at).total_seconds() / 60.0) if pos.opened_at else 0
+                if max_hold_min and held_min >= max_hold_min:
+                    _close_position(pos, float(pos.last_price or rows[-1]["close"]), f"Time Exit ({max_hold_min}m max hold)", user)
+                    exits += 1
+                    continue
                 reason = _position_trigger_from_candles(pos, rows)
                 if reason:
                     exit_px = float(pos.last_price or rows[-1]["close"])
@@ -1438,12 +1579,17 @@ def autobot_status(current_user):
         "trade_mode": cfg.trade_mode, "strategy": cfg.strategy,
         "primary_tf": cfg.primary_tf, "confirm_tf": cfg.confirm_tf,
         "scan_interval_sec": cfg.scan_interval_sec, "min_confidence": cfg.min_confidence,
+        "sl_pct": cfg.sl_pct, "tp_pct": cfg.tp_pct,
+        "risk_reward": (round(float(cfg.tp_pct or 0) / float(cfg.sl_pct or 1), 2) if float(cfg.sl_pct or 0) > 0 else None),
+        "max_hold_min": MODE_RULES.get((cfg.trade_mode or "scalp").lower(), MODE_RULES["scalp"]).get("max_hold_min"),
         "last_scan_at": cfg.last_scan_at.isoformat() if cfg.last_scan_at else None,
         "last_success_at": cfg.last_success_at.isoformat() if cfg.last_success_at else None,
         "last_error": cfg.last_error or "", "last_source": cfg.last_source or "",
         "scans_count": cfg.scans_count or 0, "entries_count": cfg.entries_count or 0, "exits_count": cfg.exits_count or 0,
         "positions": [dict(p.to_dict(),
             watchdog_age_sec=(round((_utcnow() - p.last_checked_at).total_seconds(), 1) if p.last_checked_at else None),
+            held_minutes=(round((_utcnow() - p.opened_at).total_seconds()/60.0, 1) if p.opened_at else None),
+            max_hold_minutes=MODE_RULES.get((p.trade_mode or "scalp").lower(), MODE_RULES["scalp"]).get("max_hold_min"),
             exit_state=(
                 "SL_DUE" if p.last_price is not None and _position_trigger_from_price(p, p.last_price) and str(_position_trigger_from_price(p, p.last_price)).startswith("Stop") else
                 "TP_DUE" if p.last_price is not None and _position_trigger_from_price(p, p.last_price) and str(_position_trigger_from_price(p, p.last_price)).startswith("Take") else
@@ -1467,9 +1613,10 @@ def autobot_update(current_user):
     if mode == "india":
         return jsonify({"error": "India 24x7 paper worker is disabled until a reliable Indian live-data feed is connected"}), 400
     rules = MODE_RULES.get(mode, MODE_RULES["scalp"])
-    strategy = (data.get("strategy") or current_user.strategy or "confluence").lower()
-    if strategy not in {"confluence","trend_momentum","breakout","pullback"}:
-        strategy = "confluence"
+    strategy = (data.get("strategy") or current_user.strategy or rules["default_strategy"]).lower()
+    allowed = MODE_STRATEGIES.get(mode, MODE_STRATEGIES["scalp"])
+    if strategy not in allowed:
+        strategy = rules["default_strategy"]
     cfg = AutoBotConfig.query.filter_by(user_id=current_user.id).first()
     if not cfg:
         cfg = AutoBotConfig(user_id=current_user.id)
